@@ -1,5 +1,7 @@
 # pump_bot — async Python trading systems demo
 
+> **Disclaimer:** This is educational/template software. It is not financial advice and makes no profit claims. Past paper-trading results do not predict future returns. Crypto and memecoin trading can lose all capital. Use at your own risk.
+
 [![CI](https://github.com/DeeKalshiWay/solana-pumpfun-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/DeeKalshiWay/solana-pumpfun-bot/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
