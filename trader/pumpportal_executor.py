@@ -28,6 +28,43 @@ from config import (
 )
 
 PUMPPORTAL_LOCAL_API = "https://pumpportal.fun/api/trade-local"
+# getSignatureStatuses is free. The old 2s sleep, plus cancelling every
+# other RPC when the first one had not seen the signature yet, added
+# seconds of self-inflicted confirm delay.
+CONFIRM_POLL_S = 0.4
+
+
+async def first_positive(awaitables, timeout: float):
+    """First truthy result. An empty result does not cancel the others."""
+    tasks = [asyncio.ensure_future(a) for a in awaitables]
+    pending = set(tasks)
+    found = None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    try:
+        while pending and found is None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    continue
+                value = task.result()
+                if value:
+                    found = value
+                    break
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    return found
 
 
 class PumpPortalExecutor:
@@ -370,41 +407,19 @@ class PumpPortalExecutor:
         urls = RPC_URLS or [RPC_URL]
         start = time.time()
         while time.time() - start < max_wait:
-            # Race all RPCs in parallel — first one to see "confirmed" wins.
-            # Hot RPCs see the slot first; this drops confirm tail latency.
-            tasks = [asyncio.create_task(_poll_one(u)) for u in urls]
-            try:
-                done, pending = await asyncio.wait(
-                    tasks, timeout=5, return_when=asyncio.FIRST_COMPLETED,
-                )
-            except Exception:
-                done, pending = set(), set(tasks)
-
-            status = None
-            for t in done:
-                # Defensive: _poll_one swallows exceptions and returns None,
-                # but never let a stray exception crash the confirm loop.
-                if t.cancelled() or t.exception() is not None:
-                    continue
-                s = t.result()
-                if s:
-                    status = s
-                    break
-
-            for p in pending:
-                p.cancel()
-            # Drain cancelled tasks so asyncio doesn't warn about unawaited
-            # coroutines on shutdown / some Python versions.
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-
+            # Wait out the round for a real status. A fast RPC that has
+            # not seen the signature yet must not cancel a slower one
+            # that already has it.
+            status = await first_positive(
+                [_poll_one(u) for u in urls],
+                timeout=1.0,
+            )
             if status is not None:
                 if status.get("err"):
                     logger.warning(f"PP tx {signature[:20]} failed: {status['err']}")
                     return False
                 return True
-
-            await asyncio.sleep(2)
+            await asyncio.sleep(CONFIRM_POLL_S)
         return False
 
     async def _sol_delta_from_sig(self, sig: str | None) -> float:

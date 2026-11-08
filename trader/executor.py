@@ -18,6 +18,27 @@ from trader.pumpportal_executor import PumpPortalExecutor
 MAX_PRICE_IMPACT_PCT = 40.0
 
 
+def on_bonding_curve(token: dict | None) -> bool:
+    """True when the mint is still on pump.fun's curve.
+
+    Jupiter has no route for those mints. Quoting it first costs a full
+    HTTP round trip (up to 6s on a timeout) before the buy falls through
+    to PumpPortal. Graduated tokens (curve at 100, or no pump pool tag)
+    still go through Jupiter.
+    """
+    if not token:
+        return False
+    pool = str(token.get("pool") or "").strip().lower()
+    if pool in {"pump", "pumpfun"}:
+        return True
+    raw = token.get("bonding_curve_pct")
+    try:
+        curve = float(raw)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= curve < 100
+
+
 class TradeExecutor:
     def __init__(self, keypair: Keypair):
         self.keypair = keypair
@@ -210,8 +231,12 @@ class TradeExecutor:
         return True
 
     async def buy(self, token_mint: str, sol_amount: float, token: dict = None) -> dict:
-        """Smart buy: try Jupiter first, fall back to PumpPortal."""
+        """Smart buy: Jupiter for graduated tokens, PumpPortal on the curve."""
         logger.info(f"[BUY] {token_mint[:8]}... | {sol_amount} SOL")
+
+        if on_bonding_curve(token):
+            logger.info("  -> bonding curve, skip Jupiter quote")
+            return await self.pumpportal.buy(token_mint, sol_amount)
 
         lamports = int(sol_amount * 1e9)
         jup_quote = await self.get_quote(SOL_MINT, token_mint, lamports)

@@ -104,6 +104,21 @@ async def _resolve_tokens_received(result: dict, mint: str, wallet, retries: int
     logger.warning(f"[TOKEN RESOLVE] {mint[:8]} — could not confirm token balance after {retries*2} attempts")
 
 
+# Blockhashes expire around 60s. Refresh before the 50s staleness
+# cutoff in risk_manager so a rug exit still sends the cached sell
+# instead of paying PumpPortal's build round trip (about 200-500ms).
+PREBUILD_REFRESH_S = 20.0
+PREBUILD_MAX_AGE_S = 35.0
+
+
+def prebuild_needs_refresh(pos, now: float, max_age: float = PREBUILD_MAX_AGE_S) -> bool:
+    blob = getattr(pos, "prebuilt_sell_tx", None)
+    ts = getattr(pos, "prebuilt_sell_ts", 0) or 0
+    if not blob or not ts:
+        return True
+    return (now - ts) >= max_age
+
+
 async def _prebuild_sell_for_position(executor, risk_manager, mint: str):
     """
     Background task: pre-build the sell-100% tx for a freshly-opened position
@@ -121,6 +136,26 @@ async def _prebuild_sell_for_position(executor, risk_manager, mint: str):
             logger.debug(f"[PREBUILD] sell-100% cached for {mint[:8]}... ({len(tx_bytes)} bytes)")
     except Exception as e:
         logger.debug(f"[PREBUILD] failed for {mint[:8]}: {e}")
+
+
+async def refresh_prebuilt_sells_once(executor, risk_manager, now: float | None = None) -> int:
+    """Rebuild stale cached sells. Returns how many mints were refreshed."""
+    now = time.time() if now is None else now
+    refreshed = 0
+    for mint, pos in list(risk_manager.positions.items()):
+        if prebuild_needs_refresh(pos, now):
+            await _prebuild_sell_for_position(executor, risk_manager, mint)
+            refreshed += 1
+    return refreshed
+
+
+async def refresh_prebuilt_sells(executor, risk_manager):
+    while True:
+        await asyncio.sleep(PREBUILD_REFRESH_S)
+        try:
+            await refresh_prebuilt_sells_once(executor, risk_manager)
+        except Exception as e:
+            logger.debug(f"[PREBUILD] refresh err: {e}")
 
 
 async def reconcile_positions(risk_manager, wallet, executor, paper: bool) -> None:
@@ -628,6 +663,7 @@ async def main():
         asyncio.create_task(counterfactual.run(),                                           name="counterfactual"),
         asyncio.create_task(auto_tuner.run(),                                               name="auto_tuner"),
         asyncio.create_task(daily_reporter.run(),                                           name="daily_report"),
+        asyncio.create_task(refresh_prebuilt_sells(executor, risk_mgr),                     name="prebuild_refresh"),
     ]
 
     # Dev-only: if SYNTHETIC_INJECT is set, push N synthetic tokens through
