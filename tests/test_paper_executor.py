@@ -40,7 +40,8 @@ class _FakeWallet:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # Python 3.12 does not create an implicit loop for get_event_loop().
+    return asyncio.run(coro)
 
 
 def _token(mint: str = "MINT_TEST", v_sol: float = 30.0, v_tokens: float = 1_000_000.0):

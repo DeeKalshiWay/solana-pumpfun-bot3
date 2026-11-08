@@ -2,7 +2,7 @@
 
 > **Disclaimer:** This is educational/template software. It is not financial advice and makes no profit claims. Past paper-trading results do not predict future returns. Crypto and memecoin trading can lose all capital. Use at your own risk.
 
-[![CI](https://github.com/DeeKalshiWay/solana-pumpfun-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/DeeKalshiWay/solana-pumpfun-bot/actions/workflows/ci.yml)
+[![CI](https://github.com/DeeKalshiWay/solana-pumpfun-bot3/actions/workflows/ci.yml/badge.svg)](https://github.com/DeeKalshiWay/solana-pumpfun-bot3/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -16,8 +16,9 @@ underneath; see **Limitations** for an honest read on the strategy.
 ## What this project demonstrates
 
 - **Real-time async pipeline.** One PumpPortal WebSocket fans out via
-  pub/sub to 8 detector modules. No duplicate connections, no
-  rate-limit waste. ~70 ms decision latency on Helius beta endpoint.
+  pub/sub to the detector modules (tracker, wallet intel, whale
+  tracker, regime filter). No duplicate connections, no rate-limit
+  waste. ~70 ms decision latency on Helius beta endpoint.
 - **Reliability hygiene.** Atomic JSON writes (write-temp +
   `os.replace`), PID lockfile prevents duplicate instances, watchdog
   auto-restarts the process, WebSocket rate-limit backoff with
@@ -43,25 +44,32 @@ main.py                Orchestrator — wires components, runs the asyncio task 
 config.py              Single config surface — every threshold, fee, ladder lives here
 analyzer/
   signal_scorer.py     4-factor score (creator / curve / community / momentum)
+  signal_fusion.py     Per-pattern bonus/penalty on top of the base score
+  regime_filter.py     Sliding-window new-mint regime gate
+  rug_memory.py        Pattern memory; hard-reject after repeated rug matches
+  auto_tuner.py        Rolling win-rate offset, freezable via AUTO_TUNE_ENABLED
   counterfactual.py    Re-polls rejected tokens 10 min later, aggregates verdicts
   score_bins.py        Per-score-band win-rate + EV attribution
 detector/
   pumpfun_monitor.py   Single shared PumpPortal WS with pub/sub fan-out
   pumpfun_tracker.py   v3 metadata polling for reply velocity, ATH ratio, livestream
   creator_tracker.py   Persistent leaderboard of pump.fun creators
-  wallet_intel.py      Bot-wallet accumulator + bundled-launch detection
+  wallet_intel.py      Bot-wallet accumulator, bundle detection, smart-money tags
+  whale_tracker.py     Per-wallet SOL volume on the shared WebSocket
+  x_feed.py            JSONL bridge for the optional x-monitor sidecar
   holder_filter.py     getTokenLargestAccounts → top-10 concentration check
   influencer_monitor.py  Twitter v2 watchlist for $TICKER mentions
   social_monitor.py    Twitter / Telegram mention store
   dex_monitor.py       DexScreener + Birdeye enrichment
 risk/
-  manager.py           Position sizing, stop loss, trailing stops, TP ladder,
-                       circuit breakers, momentum-stall + no-movement exits
+  manager.py           Position sizing, stops, TP ladder, circuit breakers,
+                       price-sanity, momentum-stall only after TP1
 trader/
   executor.py          Smart router: Jupiter for graduated, PumpPortal for bonding curve
-  pumpportal_executor.py  Local-tx API integration with priority fees
+  pumpportal_executor.py  PumpPortal submission; optional local-tx path (off by default)
+  local_tx_builder.py  Optional pump.fun transaction builder (USE_LOCAL_TX_BUILD)
   wallet.py            Solana wallet (solders Keypair, RPC balance queries)
-  paper_executor.py    Paper-trading simulator with realistic-friction model
+  paper_executor.py    Paper simulator with realistic, asymmetric friction
   paper_wallet.py      Persistent paper SOL balance
 logger/
   dashboard.py         Rich terminal dashboard
@@ -70,8 +78,17 @@ logger/
 deploy/
   pump_bot.service     systemd unit (hardened: NoNewPrivileges, ProtectSystem)
   install.sh           Idempotent root installer for /opt/pump_bot
-tests/                 pytest smoke tests for risk math + config invariants
+analytics/
+  go_live_gate.py      Offline pass/fail check before any live capital
+tests/                 Offline pytest suite (mocked; no trading)
+tools/                 Separate research entrypoints (graduation sniper,
+                       edge brain, paper smoke). Not started by main.py.
 ```
+
+How the two repositories were combined is in [INTEGRATION.md](INTEGRATION.md).
+`PAPER_TRADING` defaults to true. `USE_LOCAL_TX_BUILD` defaults to false.
+`tools/graduation_sniper.py` is a separate process and is not launched
+by `main.py`.
 
 ## Strategy at a glance
 
@@ -225,7 +242,7 @@ Start-ScheduledTask -TaskName PumpBot24x7
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                # 11 tests, ~0.2 s
+pytest                # offline suite; no network trading
 ruff check .          # CI-enforced
 mypy tests/           # CI-enforced on tests/, lenient elsewhere
 ```
