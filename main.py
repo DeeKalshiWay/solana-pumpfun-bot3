@@ -6,6 +6,7 @@ spending real SOL. Set False to go live.
 
 import asyncio
 import faulthandler
+import os
 import signal
 import sys
 import threading
@@ -16,6 +17,7 @@ from loguru import logger
 
 from analyzer.auto_tuner import auto_tuner
 from analyzer.counterfactual import counterfactual
+from analyzer.regime_filter import regime_filter
 from analyzer.signal_scorer import SignalScorer
 from config import (
     CREATOR_BLACKLIST,
@@ -32,6 +34,7 @@ from detector.pumpfun_monitor import PumpFunMonitor
 from detector.pumpfun_tracker import PumpFunTracker
 from detector.social_monitor import SocialMonitor
 from detector.wallet_intel import wallet_intel
+from detector.whale_tracker import whale_tracker
 from logger.daily_report import DailyReporter
 from logger.dashboard import Dashboard, setup_logging
 from logger.report import ReportLogger
@@ -142,9 +145,12 @@ async def trade_loop(trade_queue, executor, risk_manager, dashboard, wallet):
             dashboard.record_signal(token)
             continue
 
-        sol_amount = await risk_manager.calculate_position_size(score)
+        sol_amount, reject_reason = await risk_manager.calculate_position_size(score, symbol=symbol)
         if sol_amount <= 0:
-            token["reject_reason"] = "no_capacity"
+            # reject_reason is one of: emergency_stop, paused_<sub>,
+            # max_positions, symbol_cap, max_exposure, size_below_min.
+            # Falls back to "no_capacity" if the sizer surfaced none (defensive).
+            token["reject_reason"] = reject_reason or "no_capacity"
             dashboard.record_signal(token)
             continue
 
@@ -485,6 +491,12 @@ async def main():
     pumpfun_tracker  = PumpFunTracker(monitor=pumpfun_monitor)
     # Wallet intel attaches before monitor.run() so it sees every event.
     wallet_intel.attach(pumpfun_monitor)
+    # Whale tracker piggybacks on the same shared WS — aggregates SOL
+    # volume per wallet so the scorer sees "real money bought this".
+    whale_tracker.attach(pumpfun_monitor)
+    # Regime filter also subscribes to creates to maintain its sliding window
+    # of new-mint rates. No state to seed — bootstrap-safe.
+    regime_filter.attach(pumpfun_monitor)
     # Auto-tuner needs the live risk_manager to read closed_trades.
     auto_tuner.attach(risk_mgr)
     trending_scanner = TrendingScanner(raw_queue)
@@ -521,6 +533,44 @@ async def main():
         asyncio.create_task(auto_tuner.run(),                                               name="auto_tuner"),
         asyncio.create_task(daily_reporter.run(),                                           name="daily_report"),
     ]
+
+    # Dev-only: if SYNTHETIC_INJECT is set, push N synthetic tokens through
+    # the raw_queue at startup. Used when the live PumpPortal WS is
+    # unreachable (sandboxed IPs) to prove the rest of the decision
+    # pipeline fires end-to-end. SAFE only in PAPER_TRADING mode.
+    _synth_n = os.environ.get("SYNTHETIC_INJECT", "")
+    if _synth_n and PAPER_TRADING:
+        try:
+            n = max(1, int(_synth_n))
+            from tools.synthetic_injector import inject_synthetic_tokens
+            tasks.append(asyncio.create_task(
+                inject_synthetic_tokens(raw_queue, count=n, interval_s=6.0),
+                name="synthetic_inject",
+            ))
+        except Exception as e:
+            logger.warning(f"[SYNTHETIC] failed to start injector: {e}")
+
+        # Auto-enable the price mover whenever synthetic injection is on
+        # (you ~never want one without the other). Operator can disable
+        # explicitly via SYNTHETIC_PRICE_MOVES=0. Synthetic mints have no
+        # on-chain price feed; without the mover, every position exits
+        # via no_movement at full-friction loss and the exit-logic
+        # branches (TP, trailing stop, stop loss) never fire.
+        if os.environ.get("SYNTHETIC_PRICE_MOVES", "1").lower() in ("1", "true", "yes", "on"):
+            try:
+                from tools.synthetic_price_mover import SyntheticPriceMover
+                mover = SyntheticPriceMover(risk_mgr, executor)
+                tasks.append(asyncio.create_task(
+                    mover.run(),
+                    name="synthetic_price_mover",
+                ))
+            except Exception as e:
+                logger.warning(f"[SYNTHETIC] failed to start price mover: {e}")
+    elif _synth_n and not PAPER_TRADING:
+        logger.critical(
+            "[SYNTHETIC] Refusing to inject synthetic tokens in LIVE mode "
+            "(SYNTHETIC_INJECT only valid with PAPER_TRADING=true)."
+        )
 
     logger.success("All systems GO — bot is live")
 

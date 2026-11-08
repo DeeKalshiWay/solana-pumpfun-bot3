@@ -61,8 +61,8 @@ def _env_json(name: str, default):
 PAPER_TRADING       = _env_bool("PAPER_TRADING", True)   # Safe default: paper.
                                                           # Set PAPER_TRADING=false in
                                                           # .env to enable real-money trading.
-PAPER_STARTING_SOL  = 1.0    # Virtual SOL balance for paper mode
-PAPER_TIME_EXIT_MIN = 10      # Force-exit paper positions after N minutes
+PAPER_STARTING_SOL  = _env_float("PAPER_STARTING_SOL", 1.0)  # Virtual SOL balance for paper mode
+PAPER_TIME_EXIT_MIN = _env_int  ("PAPER_TIME_EXIT_MIN", 10)  # Force-exit paper positions after N minutes
 
 # ─── WALLET ────────────────────────────────────────────────────────────────────
 PRIVATE_KEY    = os.getenv("SOLANA_PRIVATE_KEY", "YOUR_PRIVATE_KEY_HERE")
@@ -87,17 +87,97 @@ REPORT_EMAIL_FROM  = os.getenv("REPORT_EMAIL_FROM", "") or SMTP_USER
 # We'll race the same signed tx across RPC_URL + all extras and use whichever
 # accepts/confirms first. Drops Stage-3 tail latency — single-RPC stalls are
 # the long pole on busy slots.
+#
+# Jito region pinning: the generic mainnet.block-engine.jito.wtf URL routes
+# to "whichever Jito node is closest" via DNS — which adds an extra hop and
+# 20-50ms per tx vs. picking the specific regional endpoint. Setting
+# JITO_REGION in .env (e.g. JITO_REGION=ny) prepends the pinned URL to
+# RPC_URLS automatically. Empty / unset = no Jito lane added.
+
+# Known Jito Block Engine regions. URL shape:
+#   https://<region>.mainnet.block-engine.jito.wtf/api/v1/transactions
+# Source: https://docs.jito.wtf/lowlatencytxnsend/
+JITO_REGIONS = {
+    "ny":        "ny.mainnet.block-engine.jito.wtf",          # New York
+    "slc":       "slc.mainnet.block-engine.jito.wtf",         # Salt Lake City
+    "frankfurt": "frankfurt.mainnet.block-engine.jito.wtf",   # Frankfurt
+    "amsterdam": "amsterdam.mainnet.block-engine.jito.wtf",   # Amsterdam
+    "dublin":    "dublin.mainnet.block-engine.jito.wtf",      # Dublin
+    "london":    "london.mainnet.block-engine.jito.wtf",      # London
+    "tokyo":     "tokyo.mainnet.block-engine.jito.wtf",       # Tokyo
+    "singapore": "singapore.mainnet.block-engine.jito.wtf",   # Singapore
+}
+
+
+def _jito_url_for_region(region: str) -> str | None:
+    """Return the pinned regional sendTransaction URL, or None if the
+    region is unknown / empty. Case-insensitive."""
+    key = (region or "").strip().lower()
+    if not key:
+        return None
+    host = JITO_REGIONS.get(key)
+    if not host:
+        return None
+    return f"https://{host}/api/v1/transactions"
+
+
 def _load_rpc_urls() -> list[str]:
     urls = [RPC_URL] if RPC_URL else []
+
+    # Auto-prepend the pinned Jito region URL if JITO_REGION is set.
+    # Prepended (not appended) so the multi-RPC race in pumpportal_executor
+    # benefits from the fastest endpoint first — even though all lanes
+    # race in parallel, the one that fires first wins more often.
+    jito_url = _jito_url_for_region(os.getenv("JITO_REGION", ""))
+    if jito_url and jito_url not in urls:
+        urls.insert(0, jito_url)
+
     extra = os.getenv("EXTRA_RPC_URLS", "").strip()
     if extra:
         for u in extra.split(","):
             u = u.strip()
             if u and u not in urls:
                 urls.append(u)
+
+    # Warn at config-load time if the generic Jito catch-all is in the
+    # list. That URL DNS-routes to whichever node is closest with an extra
+    # hop — 20-50ms slower than naming the regional URL explicitly. We
+    # don't auto-replace it (no way to know which region they meant),
+    # just nudge.
+    for u in urls:
+        if "block-engine.jito.wtf" in u and not any(
+            f"{r}.mainnet.block-engine.jito.wtf" in u for r in JITO_REGIONS
+        ):
+            # Lazy import so config.py stays fast at module load.
+            import logging
+            logging.getLogger(__name__).warning(
+                "[CONFIG] Generic Jito URL detected (%s). Set JITO_REGION=ny|slc|"
+                "frankfurt|amsterdam|dublin|london|tokyo|singapore for a 20-50ms "
+                "tail-latency win on tx submission.", u,
+            )
+            break
+
     return urls
 
 RPC_URLS = _load_rpc_urls()
+
+# ─── EXPERIMENTAL — local pump.fun tx construction ─────────────────────────
+# Default OFF. When enabled, the PumpPortal executor builds buy/sell
+# transactions locally via trader/local_tx_builder.py instead of calling
+# PumpPortal's /api/trade-local HTTP endpoint. Skips ~200-500ms per tx.
+#
+# ⚠️  Validate against PumpPortal API output BEFORE enabling on a live
+# wallet — the pump.fun program's account order is encoded against an
+# Anchor IDL that wasn't directly verified when the builder was written.
+# See trader/local_tx_builder.py docstring for the validation procedure.
+USE_LOCAL_TX_BUILD = _env_bool("USE_LOCAL_TX_BUILD", False)
+
+# Compute Budget knobs for the local tx path. pump.fun swaps are simple
+# and fit easily in 200K CU; the CU PRICE (in micro-lamports per CU) is
+# the per-CU priority fee. Total tx priority fee paid = CU_LIMIT × CU_PRICE / 1e6
+# lamports. 200_000 × 300_000 / 1e6 = 60_000 lamports = 0.00006 SOL.
+COMPUTE_UNIT_LIMIT                = _env_int("COMPUTE_UNIT_LIMIT",                200_000)
+COMPUTE_UNIT_PRICE_MICROLAMPORTS  = _env_int("COMPUTE_UNIT_PRICE_MICROLAMPORTS",  300_000)
 
 # ─── API KEYS ──────────────────────────────────────────────────────────────────
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "")
@@ -175,7 +255,12 @@ BUY_COOLDOWN_SECONDS  = _env_int("BUY_COOLDOWN_SECONDS",  15)
 # < 0.30 SOL produced the bulk of the +100% pumps and 100% of the
 # moonshots in the rejected sample. Big initial buy = creator bag dump risk.
 # Hard filter at this threshold; the scoring also inverts to reward small.
-MAX_INITIAL_BUY_SOL   = _env_float("MAX_INITIAL_BUY_SOL",  1.5)
+MAX_INITIAL_BUY_SOL   = _env_float("MAX_INITIAL_BUY_SOL",  3.5)
+# Bumped 1.5 -> 3.5 on 2026-05-10 from analytics/holdout_validation.md:
+# only big_init_buy buckets at 3.95/4.0/4.94 SOL validated on held-out
+# data (80%+ rug rate). Buckets at 2-3 SOL had 2-10% rug rate (LOWER than
+# the 36% base) -- the filter was killing winners. 3.5 is the floor that
+# preserves all validated buckets while dropping the killing-winners zone.
 
 # ─── CREATOR TRACKING (Dexter strategy) ───────────────────────────────────────
 CREATOR_TRACKING_ENABLED = _env_bool("CREATOR_TRACKING_ENABLED", True)
@@ -222,6 +307,30 @@ STOP_LOSS_PCT               = _env_float("STOP_LOSS_PCT",               15.0)
 EMERGENCY_STOP_DRAWDOWN_PCT = _env_float("EMERGENCY_STOP_DRAWDOWN_PCT", 25.0)
 TIME_EXIT_MINUTES           = _env_int("TIME_EXIT_MINUTES",              5)
 
+# Panic stop-loss: hard floor regardless of primary stop-loss state. If a
+# position rots to -25% (concentration audit floor) we fire a force-sell on
+# every monitor tick + log loudly. Belt-and-suspenders for cases where the
+# regular STOP_LOSS_PCT trigger fired but the tx failed and the position
+# kept decaying. Defaults to a wider band than STOP_LOSS_PCT so it activates
+# only on genuinely-stuck positions.
+PANIC_STOP_LOSS_PCT         = _env_float("PANIC_STOP_LOSS_PCT",         25.0)
+
+# Per-symbol lifetime cap (Plan from 2026-05-10 concentration audit:
+# top 1 ticker = 102.3% of PnL). Refuse to deploy more than this fraction
+# of starting capital into any one symbol over the bot's lifetime. Forces
+# the strategy to find edge ACROSS tickers, not within one lucky one.
+# Tracked separately per symbol (not per mint — fresh redeploys of the
+# same name still count). Set to 999 to disable.
+MAX_SYMBOL_LIFETIME_DEPLOY_PCT = _env_float("MAX_SYMBOL_LIFETIME_DEPLOY_PCT", 10.0)
+
+# Regime filter (Plan from 2026-05-10). Pause new buys when the trailing
+# 60-min new-mint rate drops below this fraction of the 24h hourly median.
+# Bootstrap-safe: filter is inactive until we've observed REGIME_MIN_HOURS
+# of data. Set REGIME_FILTER_ENABLED=false to disable.
+REGIME_FILTER_ENABLED       = _env_bool("REGIME_FILTER_ENABLED",        True)
+REGIME_PAUSE_RATIO          = _env_float("REGIME_PAUSE_RATIO",           0.5)
+REGIME_MIN_HOURS            = _env_int("REGIME_MIN_HOURS",                6)
+
 # Early-rug detector: if a fresh position drops past EARLY_RUG_PCT within
 # EARLY_RUG_WINDOW_SEC, exit immediately — don't wait for the regular stop-loss
 # check. Trade-DB analysis showed 0-2 min holds had 11-33% WR with stop-losses
@@ -234,6 +343,52 @@ EARLY_RUG_WINDOW_SEC = _env_int  ("EARLY_RUG_WINDOW_SEC",  60)
 # to logs/candidate_queue.jsonl so the control bot can post it for manual
 # yes/no review. Range is [SMART_CALLER_MIN, MIN_BUY_SCORE-1].
 SMART_CALLER_MIN = _env_int("SMART_CALLER_MIN", 20)
+
+# Signal fusion: alignment bonus added AFTER the four-factor score when
+# independent signals co-fire (e.g. X mention + smart-money buyer). Caps
+# are deliberately small — fusion is a tie-breaker, not a primary factor.
+# See analyzer/signal_fusion.py for the pattern catalog.
+# Disable via FUSION_ENABLED=0 in .env if a holdout audit shows it's
+# pulling EV in the wrong direction.
+FUSION_ENABLED      = _env_bool ("FUSION_ENABLED",      True)
+FUSION_MAX_BONUS    = _env_int  ("FUSION_MAX_BONUS",    15)
+FUSION_MAX_PENALTY  = _env_int  ("FUSION_MAX_PENALTY",  10)
+
+# Rug-memory aggressiveness. The legacy defaults (kick-in=3, cap=15, no
+# hard reject) treated the data as a soft nudge: a high-base-score token
+# could still get bought even when its exact pattern had rugged on us
+# repeatedly. The defaults below use the data as a real filter:
+#   - RUG_MATCH_MIN_RUGS=1: penalty starts after the FIRST historical rug
+#     at this signature, not after three. Faster learning, more sensitivity.
+#   - RUG_MAX_PENALTY=50: effectively uncapped — overwhelming evidence can
+#     dominate the score. Linear: penalty = min(cap, n_matches * 2).
+#   - RUG_HARD_REJECT_MATCHES=3: signatures with N+ historical rugs are
+#     hard-rejected at the filter stage, regardless of score. "We've seen
+#     this pattern lose three times — don't buy no matter how shiny."
+# All three are env-tunable so the operator can dial back if it gets too
+# aggressive and the buy rate collapses.
+RUG_MATCH_MIN_RUGS       = _env_int("RUG_MATCH_MIN_RUGS",       1)
+RUG_MAX_PENALTY          = _env_int("RUG_MAX_PENALTY",          50)
+RUG_HARD_REJECT_MATCHES  = _env_int("RUG_HARD_REJECT_MATCHES",  3)
+
+# Auto-tuner controls. The auto_tuner watches recent-trade win-rate and
+# shifts the live MIN_BUY_SCORE up (tighten) when WR drops below
+# WR_LOW or down (loosen) when above WR_HIGH. Bounded by
+# [OFFSET_MIN, OFFSET_MAX] so it can't drift too far from the operator's
+# chosen base.
+#
+# Set AUTO_TUNE_ENABLED=false in .env to fully freeze the threshold at
+# MIN_BUY_SCORE — useful when the WR statistic is dominated by trades
+# that happened under since-fixed bugs (Anchor 3012, pre-TP1 stalls,
+# soft-only rug memory) and is therefore not predictive going forward.
+# Operator can re-enable once a fresh post-fix sample has accumulated.
+#
+# AUTO_TUNE_OFFSET_MAX=0 is a softer middle ground: auto-tuner can still
+# LOOSEN on a hot streak (offset goes negative, threshold drops) but can
+# never tighten above the base. AUTO_TUNE_OFFSET_MIN bounds loosening.
+AUTO_TUNE_ENABLED     = _env_bool("AUTO_TUNE_ENABLED",     True)
+AUTO_TUNE_OFFSET_MIN  = _env_int ("AUTO_TUNE_OFFSET_MIN",  -3)
+AUTO_TUNE_OFFSET_MAX  = _env_int ("AUTO_TUNE_OFFSET_MAX",   5)
 
 # Creators that produced rugs we've already lost on, OR rugged after we
 # rejected their token. Block at trade-loop level so we never enter again.
@@ -275,13 +430,40 @@ MOMENTUM_STALL_PCT_BAND   = _env_float("MOMENTUM_STALL_PCT_BAND",     5.0)
 MOMENTUM_STALL_WINDOW_SEC = _env_int("MOMENTUM_STALL_WINDOW_SEC",    60)
 MOMENTUM_STALL_MIN_PROFIT = _env_float("MOMENTUM_STALL_MIN_PROFIT",   5.0)
 
+# Latency-honest exit pricing (paper sim only).
+# When a force-sell fires, the paper executor will look up the position's
+# price `EXIT_LATENCY` seconds ago instead of the latest tick — modeling
+# the time between detect and on-chain confirmation. STAMPEDE_MULT scales
+# the size slippage on stall-class exits to model adverse selection: every
+# bot watching the same WS feed exits at the same moment.
+EXIT_LATENCY_ENABLED      = _env_bool("EXIT_LATENCY_ENABLED",        True)
+EXIT_LATENCY_P50_S        = _env_float("EXIT_LATENCY_P50_S",          0.8)
+EXIT_LATENCY_P99_S        = _env_float("EXIT_LATENCY_P99_S",          3.0)
+STAMPEDE_MULT_STALL       = _env_float("STAMPEDE_MULT_STALL",         5.0)
+
 # Holder concentration filter (rug indicator). Calls getTokenLargestAccounts.
 # Skip a token if top 10 holders own more than this % of supply.
 # Set 0 to disable.
 HOLDER_CONCENTRATION_LIMIT_PCT = 70.0
 
 # ─── EXECUTION SETTINGS ────────────────────────────────────────────────────────
-SLIPPAGE_BPS               = 1500   # 15% — pump.fun tokens need wide slippage
+# Single global slippage. Kept for backward compat — used as a fallback when
+# the asymmetric overrides below aren't set. Most live runs should set the
+# asymmetric values instead.
+SLIPPAGE_BPS               = _env_int("SLIPPAGE_BPS",       1500)   # 15%
+
+# Asymmetric slippage. Live observation 2026-05-16: a single global at 15%
+# was too tight for emergency sells — pump.fun's bonding-curve sell instruction
+# rejects with `Custom: 6001` (min-sol-output not met) when the curve moves
+# more than 15% against us between tx send and confirm. Five live positions
+# got stranded at 0.05 SOL each because every force-sell reverted on chain.
+#
+# The fix: keep BUY slippage tight (you don't want to overpay into a pump)
+# but loosen SELL slippage substantially so emergency exits actually fill,
+# even at worse prices. Eating 5–10% on a losing exit is far better than
+# 100% on a stranded token.
+BUY_SLIPPAGE_BPS           = _env_int("BUY_SLIPPAGE_BPS",   SLIPPAGE_BPS)
+SELL_SLIPPAGE_BPS          = _env_int("SELL_SLIPPAGE_BPS",  4000)   # 40%
 PRIORITY_FEE_MICROLAMPORTS = 300000 # Jupiter/RPC fee
 PRIORITY_FEE_SOL           = _env_float("PRIORITY_FEE_SOL",      0.001)
 # Sells during a dump need to land FAST or the price moves further. Stop-loss
