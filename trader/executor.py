@@ -18,6 +18,27 @@ from trader.pumpportal_executor import PumpPortalExecutor
 MAX_PRICE_IMPACT_PCT = 40.0
 
 
+def on_bonding_curve(token: dict | None) -> bool:
+    """True when the mint is still on pump.fun's curve.
+
+    Jupiter has no route for those mints. Quoting it first costs a full
+    HTTP round trip (up to 6s on a timeout) before the buy falls through
+    to PumpPortal. Graduated tokens (curve at 100, or no pump pool tag)
+    still go through Jupiter.
+    """
+    if not token:
+        return False
+    pool = str(token.get("pool") or "").strip().lower()
+    if pool in {"pump", "pumpfun"}:
+        return True
+    raw = token.get("bonding_curve_pct")
+    try:
+        curve = float(raw)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= curve < 100
+
+
 class TradeExecutor:
     def __init__(self, keypair: Keypair):
         self.keypair = keypair
@@ -210,8 +231,12 @@ class TradeExecutor:
         return True
 
     async def buy(self, token_mint: str, sol_amount: float, token: dict = None) -> dict:
-        """Smart buy: try Jupiter first, fall back to PumpPortal."""
+        """Smart buy: Jupiter for graduated tokens, PumpPortal on the curve."""
         logger.info(f"[BUY] {token_mint[:8]}... | {sol_amount} SOL")
+
+        if on_bonding_curve(token):
+            logger.info("  -> bonding curve, skip Jupiter quote")
+            return await self.pumpportal.buy(token_mint, sol_amount)
 
         lamports = int(sol_amount * 1e9)
         jup_quote = await self.get_quote(SOL_MINT, token_mint, lamports)
@@ -225,13 +250,21 @@ class TradeExecutor:
         return await self.pumpportal.buy(token_mint, sol_amount)
 
     async def sell(self, token_mint: str, token_amount_raw, reason: str = "exit",
-                   prebuilt_tx: bytes | None = None) -> dict:
+                   prebuilt_tx: bytes | None = None,
+                   price_history: list | None = None) -> dict:
         """Smart sell: try Jupiter first, fall back to PumpPortal.
 
         prebuilt_tx (optional): pre-built PumpPortal sell tx bytes — when present
         we skip Jupiter and go straight to PumpPortal so the prebuild fast-path
         actually fires. Without this passthrough the kwarg crashes the call with
         TypeError on every emergency exit.
+
+        price_history (optional): consumed by the paper executor for
+        latency-honest exit pricing on stall-class force-sells. Live mode
+        pays real latency on the wire so the kwarg is accepted here only
+        so risk_manager._force_sell can pass it without TypeError. We
+        forward it to PumpPortalExecutor (which also accepts-and-ignores)
+        for the same reason.
         """
         logger.info(f"[SELL] {token_mint[:8]}... | reason={reason}")
 
@@ -240,7 +273,8 @@ class TradeExecutor:
         # emergency-exit path.
         if prebuilt_tx is not None:
             return await self.pumpportal.sell(token_mint, token_amount_raw, reason,
-                                              prebuilt_tx=prebuilt_tx)
+                                              prebuilt_tx=prebuilt_tx,
+                                              price_history=price_history)
 
         # Only try Jupiter if we have a raw count (not a % string)
         if isinstance(token_amount_raw, int) and token_amount_raw > 0:
@@ -250,11 +284,17 @@ class TradeExecutor:
             # If Jupiter fails with no_route, fall back
             if jup_result.get("error") in ("no_route", "build_failed"):
                 logger.info(f"  -> Jupiter failed ({jup_result.get('error')}), using PumpPortal")
-                return await self.pumpportal.sell(token_mint, token_amount_raw, reason)
+                return await self.pumpportal.sell(token_mint, token_amount_raw, reason,
+                                                  price_history=price_history)
             return jup_result
 
         # Percentage string or unknown amount → PumpPortal directly
-        return await self.pumpportal.sell(token_mint, token_amount_raw, reason)
+        return await self.pumpportal.sell(token_mint, token_amount_raw, reason,
+                                          price_history=price_history)
+
+    async def confirm_signature(self, signature: str, max_wait: int = 45) -> bool:
+        """Extra confirm window for a buy whose first wait expired."""
+        return await self.pumpportal._confirm(signature, max_wait=max_wait)
 
     async def prebuild_sell_tx(self, token_mint: str) -> bytes | None:
         """Delegate to PumpPortal — only the bonding-curve venue supports the

@@ -6,6 +6,7 @@ spending real SOL. Set False to go live.
 
 import asyncio
 import faulthandler
+import os
 import signal
 import sys
 import threading
@@ -16,6 +17,7 @@ from loguru import logger
 
 from analyzer.auto_tuner import auto_tuner
 from analyzer.counterfactual import counterfactual
+from analyzer.regime_filter import regime_filter
 from analyzer.signal_scorer import SignalScorer
 from config import (
     CREATOR_BLACKLIST,
@@ -32,6 +34,7 @@ from detector.pumpfun_monitor import PumpFunMonitor
 from detector.pumpfun_tracker import PumpFunTracker
 from detector.social_monitor import SocialMonitor
 from detector.wallet_intel import wallet_intel
+from detector.whale_tracker import whale_tracker
 from logger.daily_report import DailyReporter
 from logger.dashboard import Dashboard, setup_logging
 from logger.report import ReportLogger
@@ -101,6 +104,21 @@ async def _resolve_tokens_received(result: dict, mint: str, wallet, retries: int
     logger.warning(f"[TOKEN RESOLVE] {mint[:8]} — could not confirm token balance after {retries*2} attempts")
 
 
+# Blockhashes expire around 60s. Refresh before the 50s staleness
+# cutoff in risk_manager so a rug exit still sends the cached sell
+# instead of paying PumpPortal's build round trip (about 200-500ms).
+PREBUILD_REFRESH_S = 20.0
+PREBUILD_MAX_AGE_S = 35.0
+
+
+def prebuild_needs_refresh(pos, now: float, max_age: float = PREBUILD_MAX_AGE_S) -> bool:
+    blob = getattr(pos, "prebuilt_sell_tx", None)
+    ts = getattr(pos, "prebuilt_sell_ts", 0) or 0
+    if not blob or not ts:
+        return True
+    return (now - ts) >= max_age
+
+
 async def _prebuild_sell_for_position(executor, risk_manager, mint: str):
     """
     Background task: pre-build the sell-100% tx for a freshly-opened position
@@ -120,6 +138,110 @@ async def _prebuild_sell_for_position(executor, risk_manager, mint: str):
         logger.debug(f"[PREBUILD] failed for {mint[:8]}: {e}")
 
 
+async def refresh_prebuilt_sells_once(executor, risk_manager, now: float | None = None) -> int:
+    """Rebuild stale cached sells. Returns how many mints were refreshed."""
+    now = time.time() if now is None else now
+    refreshed = 0
+    for mint, pos in list(risk_manager.positions.items()):
+        if prebuild_needs_refresh(pos, now):
+            await _prebuild_sell_for_position(executor, risk_manager, mint)
+            refreshed += 1
+    return refreshed
+
+
+async def refresh_prebuilt_sells(executor, risk_manager):
+    while True:
+        await asyncio.sleep(PREBUILD_REFRESH_S)
+        try:
+            await refresh_prebuilt_sells_once(executor, risk_manager)
+        except Exception as e:
+            logger.debug(f"[PREBUILD] refresh err: {e}")
+
+
+async def reconcile_positions(risk_manager, wallet, executor, paper: bool) -> None:
+    """Paper: reload in-memory inventory from the restored book.
+
+    Live: if the chain reports a positive balance that disagrees with
+    the book, trust the chain. Unknown reads are left alone. A confirmed
+    zero is logged and left open so a later sell can still be attempted
+    instead of silently booking a fake loss during an RPC miss.
+    """
+    if paper:
+        restore = getattr(executor, "restore_inventory", None)
+        if restore is not None:
+            n = restore(risk_manager.positions)
+            if n:
+                logger.warning(f"[RECONCILE] Restored paper inventory for {n} position(s)")
+        return
+
+    status_fn = getattr(wallet, "get_token_balance_status", None)
+    if status_fn is None:
+        return
+    for mint, pos in list(risk_manager.positions.items()):
+        bal = await status_fn(mint)
+        if bal is None:
+            logger.error(f"[RECONCILE] {pos.symbol} balance unknown; book unchanged")
+            continue
+        raw = int(round(bal * 1_000_000))
+        if raw <= 0:
+            logger.critical(
+                f"[RECONCILE] {pos.symbol} ({mint[:8]}) confirmed 0 tokens on chain; "
+                "position stays open until a sell resolves it"
+            )
+            continue
+        if raw != pos.tokens_held:
+            logger.warning(
+                f"[RECONCILE] {pos.symbol} book {pos.tokens_held} -> chain {raw}"
+            )
+            pos.tokens_held = raw
+            risk_manager._save_open_positions()
+
+
+async def _adopt_landed_buy(
+    executor, risk_manager, wallet, token: dict, result: dict,
+    resolve_delay: float = 2.0, resolve_retries: int = 4,
+) -> None:
+    """If an unconfirmed buy later lands, open the position.
+
+    The first confirm window can expire while the transaction is still
+    in flight. Leaving it untracked spends SOL with no stop and no TP.
+    """
+    sig = result.get("signature")
+    mint = token.get("mint", "")
+    if not sig or not mint or mint in risk_manager.positions:
+        return
+    confirm = getattr(executor, "confirm_signature", None)
+    if confirm is None:
+        return
+    try:
+        ok = await confirm(sig)
+    except Exception as e:
+        logger.error(f"[ADOPT] confirm failed for {mint[:8]}: {e}")
+        return
+    if not ok or mint in risk_manager.positions:
+        return
+    adopted = dict(result)
+    adopted["success"] = True
+    adopted["error"] = None
+    if int(adopted.get("tokens_expected") or 0) <= 0:
+        await _resolve_tokens_received(
+            adopted, mint, wallet, retries=resolve_retries, delay=resolve_delay,
+        )
+    if int(adopted.get("tokens_expected") or 0) <= 0:
+        logger.critical(
+            f"[ADOPT] {token.get('symbol', mint[:8])} buy {sig[:12]} landed "
+            "but token amount is still unknown"
+        )
+        return
+    if mint in risk_manager.positions:
+        return
+    risk_manager.open_position(token, adopted)
+    logger.warning(
+        f"[ADOPT] Opened {token.get('symbol', mint[:8])} after late confirm {sig[:12]}"
+    )
+    asyncio.create_task(_prebuild_sell_for_position(executor, risk_manager, mint))
+
+
 async def trade_loop(trade_queue, executor, risk_manager, dashboard, wallet):
     while True:
         try:
@@ -135,6 +257,11 @@ async def trade_loop(trade_queue, executor, risk_manager, dashboard, wallet):
         score   = token.get("score", 0)
         creator = token.get("creator", "")
 
+        if mint in risk_manager.positions:
+            token["reject_reason"] = "already_open"
+            dashboard.record_signal(token)
+            continue
+
         # Block creators that produced repeat losers (see config.CREATOR_BLACKLIST).
         if creator and creator in CREATOR_BLACKLIST:
             logger.info(f"[TRADE LOOP] Skip {symbol}: creator {creator[:8]}... is blacklisted")
@@ -142,9 +269,14 @@ async def trade_loop(trade_queue, executor, risk_manager, dashboard, wallet):
             dashboard.record_signal(token)
             continue
 
-        sol_amount = await risk_manager.calculate_position_size(score)
+        sol_amount, reject_reason = await risk_manager.calculate_position_size(
+            score, symbol=symbol, creator=creator,
+        )
         if sol_amount <= 0:
-            token["reject_reason"] = "no_capacity"
+            # reject_reason is one of: emergency_stop, paused_<sub>,
+            # max_positions, symbol_cap, max_exposure, size_below_min.
+            # Falls back to "no_capacity" if the sizer surfaced none (defensive).
+            token["reject_reason"] = reject_reason or "no_capacity"
             dashboard.record_signal(token)
             continue
 
@@ -170,6 +302,10 @@ async def trade_loop(trade_queue, executor, risk_manager, dashboard, wallet):
         else:
             token["reject_reason"] = result.get("error", "buy_failed")
             logger.error(f"[TRADE LOOP] Buy failed {symbol}: {token['reject_reason']}")
+            if result.get("error") == "unconfirmed" and result.get("signature"):
+                asyncio.create_task(
+                    _adopt_landed_buy(executor, risk_manager, wallet, token, result)
+                )
 
         dashboard.record_signal(token)
 
@@ -473,6 +609,7 @@ async def main():
 
     risk_mgr  = RiskManager(wallet, executor)
     await risk_mgr.initialize()
+    await reconcile_positions(risk_mgr, wallet, executor, PAPER_TRADING)
 
     scorer     = SignalScorer(raw_queue, trade_queue, executor=executor)
     dashboard  = Dashboard(risk_mgr, scorer)
@@ -485,6 +622,12 @@ async def main():
     pumpfun_tracker  = PumpFunTracker(monitor=pumpfun_monitor)
     # Wallet intel attaches before monitor.run() so it sees every event.
     wallet_intel.attach(pumpfun_monitor)
+    # Whale tracker piggybacks on the same shared WS — aggregates SOL
+    # volume per wallet so the scorer sees "real money bought this".
+    whale_tracker.attach(pumpfun_monitor)
+    # Regime filter also subscribes to creates to maintain its sliding window
+    # of new-mint rates. No state to seed — bootstrap-safe.
+    regime_filter.attach(pumpfun_monitor)
     # Auto-tuner needs the live risk_manager to read closed_trades.
     auto_tuner.attach(risk_mgr)
     trending_scanner = TrendingScanner(raw_queue)
@@ -520,7 +663,46 @@ async def main():
         asyncio.create_task(counterfactual.run(),                                           name="counterfactual"),
         asyncio.create_task(auto_tuner.run(),                                               name="auto_tuner"),
         asyncio.create_task(daily_reporter.run(),                                           name="daily_report"),
+        asyncio.create_task(refresh_prebuilt_sells(executor, risk_mgr),                     name="prebuild_refresh"),
     ]
+
+    # Dev-only: if SYNTHETIC_INJECT is set, push N synthetic tokens through
+    # the raw_queue at startup. Used when the live PumpPortal WS is
+    # unreachable (sandboxed IPs) to prove the rest of the decision
+    # pipeline fires end-to-end. SAFE only in PAPER_TRADING mode.
+    _synth_n = os.environ.get("SYNTHETIC_INJECT", "")
+    if _synth_n and PAPER_TRADING:
+        try:
+            n = max(1, int(_synth_n))
+            from tools.synthetic_injector import inject_synthetic_tokens
+            tasks.append(asyncio.create_task(
+                inject_synthetic_tokens(raw_queue, count=n, interval_s=6.0),
+                name="synthetic_inject",
+            ))
+        except Exception as e:
+            logger.warning(f"[SYNTHETIC] failed to start injector: {e}")
+
+        # Auto-enable the price mover whenever synthetic injection is on
+        # (you ~never want one without the other). Operator can disable
+        # explicitly via SYNTHETIC_PRICE_MOVES=0. Synthetic mints have no
+        # on-chain price feed; without the mover, every position exits
+        # via no_movement at full-friction loss and the exit-logic
+        # branches (TP, trailing stop, stop loss) never fire.
+        if os.environ.get("SYNTHETIC_PRICE_MOVES", "1").lower() in ("1", "true", "yes", "on"):
+            try:
+                from tools.synthetic_price_mover import SyntheticPriceMover
+                mover = SyntheticPriceMover(risk_mgr, executor)
+                tasks.append(asyncio.create_task(
+                    mover.run(),
+                    name="synthetic_price_mover",
+                ))
+            except Exception as e:
+                logger.warning(f"[SYNTHETIC] failed to start price mover: {e}")
+    elif _synth_n and not PAPER_TRADING:
+        logger.critical(
+            "[SYNTHETIC] Refusing to inject synthetic tokens in LIVE mode "
+            "(SYNTHETIC_INJECT only valid with PAPER_TRADING=true)."
+        )
 
     logger.success("All systems GO — bot is live")
 

@@ -13,6 +13,9 @@ API endpoints:
 """
 
 import asyncio
+import base64
+import binascii
+import hmac
 import os
 import socket
 import time
@@ -26,6 +29,7 @@ from analyzer.score_bins import aggregate_by_score
 from detector.creator_tracker import creator_tracker
 from detector.influencer_monitor import influencer_monitor
 from detector.wallet_intel import wallet_intel
+from detector.whale_tracker import whale_tracker
 
 
 def _get_lan_ip() -> str:
@@ -41,8 +45,41 @@ def _get_lan_ip() -> str:
 
 
 WEB_DIR  = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web")
-WEB_HOST = "0.0.0.0"   # listen on all interfaces (LAN-accessible)
+# Loopback unless the operator sets DASHBOARD_HOST. Control POSTs can
+# emergency-stop the bot and force-sell positions.
+WEB_HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
 WEB_PORT = 8765
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+# Optional HTTP Basic Auth. If both env vars are set, every dashboard route
+# (HTML, API, control POSTs) requires the credentials. Recommended whenever
+# WEB_HOST is anything other than 127.0.0.1, since the control endpoints can
+# emergency-stop the bot or force-sell open positions.
+_AUTH_USER = os.environ.get("DASHBOARD_AUTH_USER", "")
+_AUTH_PASS = os.environ.get("DASHBOARD_AUTH_PASS", "")
+_AUTH_ENABLED = bool(_AUTH_USER and _AUTH_PASS)
+
+
+def dashboard_bind_allowed(host: str | None = None, auth_enabled: bool | None = None) -> bool:
+    """Non-loopback binds require both dashboard auth env vars."""
+    chosen = WEB_HOST if host is None else host
+    authed = _AUTH_ENABLED if auth_enabled is None else auth_enabled
+    return chosen in _LOOPBACK_HOSTS or bool(authed)
+
+
+def _check_basic_auth(header_value: str) -> bool:
+    """Constant-time check of a 'Basic <base64>' Authorization header."""
+    if not header_value or not header_value.lower().startswith("basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header_value.split(" ", 1)[1], validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return False
+    user, _, pw = decoded.partition(":")
+    return (
+        hmac.compare_digest(user, _AUTH_USER)
+        and hmac.compare_digest(pw, _AUTH_PASS)
+    )
 
 
 class WebDashboard:
@@ -142,6 +179,7 @@ class WebDashboard:
                 "symbol":         token.get("symbol", "???"),
                 "mint":           token.get("mint", ""),
                 "score":          token.get("score", 0),
+                "raw_score":      token.get("raw_score", token.get("score", 0)),
                 "market_cap_sol": token.get("market_cap_sol", 0),
                 "initial_buy":    token.get("initial_buy_sol", 0),
                 "curve_pct":      token.get("bonding_curve_pct", 0),
@@ -149,6 +187,9 @@ class WebDashboard:
                 "reject_reason":  token.get("reject_reason", ""),
                 "scored_at":      token.get("scored_at", 0),
                 "breakdown":      token.get("score_breakdown", {}),
+                # Per-pattern fusion contributions (name -> signed int).
+                # Empty when no fusion pattern fired or fusion disabled.
+                "fusion_patterns": token.get("fusion_patterns", {}),
             })
         return web.json_response(out)
 
@@ -187,6 +228,7 @@ class WebDashboard:
             "bundles_flagged":   sum(1 for v in wallet_intel._bundle_decided.values() if v),
             "influencer_hits":   influencer_hits,
             "influencer_handles": influencer_monitor._handles,
+            "whales":            whale_tracker.stats(),
         })
 
     async def api_learn(self, request):
@@ -218,6 +260,8 @@ class WebDashboard:
         if not body.get("confirm"):
             return web.json_response({"ok": False, "error": "missing confirm"}, status=400)
         self.risk_mgr.emergency_stop_active = True
+        if hasattr(self.risk_mgr, "_save_risk_state"):
+            self.risk_mgr._save_risk_state()
         logger.critical("[DASHBOARD] EMERGENCY STOP triggered via web UI — force-selling all positions")
         return web.json_response({"ok": True, "emergency_stop": True})
 
@@ -256,6 +300,8 @@ class WebDashboard:
         self.risk_mgr.emergency_stop_active = False
         # Also clear force-sell in case auto-drawdown trigger had set it
         self.risk_mgr.emergency_force_sell = False
+        if hasattr(self.risk_mgr, "_save_risk_state"):
+            self.risk_mgr._save_risk_state()
         logger.warning("[DASHBOARD] Emergency stop cleared via web UI — trading resumed")
         return web.json_response({"ok": True, "emergency_stop": False})
 
@@ -277,6 +323,19 @@ class WebDashboard:
 
     # ── Server lifecycle ──────────────────────────────────────────────────────
     @web.middleware
+    async def _auth_middleware(self, request, handler):
+        # Pre-flight requests can't carry an Authorization header; let CORS handle them.
+        if not _AUTH_ENABLED or request.method == "OPTIONS":
+            return await handler(request)
+        if not _check_basic_auth(request.headers.get("Authorization", "")):
+            return web.Response(
+                status=401,
+                headers={"WWW-Authenticate": 'Basic realm="pump-bot dashboard", charset="UTF-8"'},
+                text="Unauthorized",
+            )
+        return await handler(request)
+
+    @web.middleware
     async def _cors_middleware(self, request, handler):
         # Allow the GitHub Pages portfolio site to fetch /api/* across origins.
         # Read-only API; no credentials sent.
@@ -286,11 +345,18 @@ class WebDashboard:
             resp = await handler(request)
         resp.headers["Access-Control-Allow-Origin"]  = "*"
         resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return resp
 
     async def run(self):
-        app = web.Application(middlewares=[self._cors_middleware])
+        if not dashboard_bind_allowed():
+            logger.critical(
+                "Refusing to start the dashboard on {} without "
+                "DASHBOARD_AUTH_USER and DASHBOARD_AUTH_PASS.",
+                WEB_HOST,
+            )
+            return
+        app = web.Application(middlewares=[self._auth_middleware, self._cors_middleware])
         app.router.add_get("/",              self.index)
         app.router.add_get("/api/status",    self.api_status)
         app.router.add_get("/api/positions", self.api_positions)
@@ -312,6 +378,14 @@ class WebDashboard:
         logger.success("Web dashboard running:")
         logger.success(f"  Local:    http://127.0.0.1:{WEB_PORT}/")
         logger.success(f"  LAN/phone: http://{lan_ip}:{WEB_PORT}/")
+        if _AUTH_ENABLED:
+            logger.success(f"  Basic Auth: ENABLED (user='{_AUTH_USER}')")
+        elif WEB_HOST != "127.0.0.1":
+            logger.warning(
+                "Dashboard auth is DISABLED and bound to {host}: anyone on the network can "
+                "trigger emergency-stop / force-sell. Set DASHBOARD_AUTH_USER and "
+                "DASHBOARD_AUTH_PASS to require Basic Auth.", host=WEB_HOST,
+            )
 
         # Keep alive until cancelled
         try:

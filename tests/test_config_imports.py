@@ -2,6 +2,7 @@
 (syntax error, missing import, removed constant), CI catches it before
 it ever hits the running bot."""
 import importlib
+from pathlib import Path
 
 
 def test_config_imports():
@@ -40,3 +41,16 @@ def test_risk_invariants():
 
 def test_risk_module_imports():
     importlib.import_module("risk.manager")
+
+
+def test_committed_safe_defaults():
+    """The integration must keep paper mode on and local tx building off
+    unless an operator opts in. Assert the source defaults, not the
+    process environment (load_dotenv can override the live values)."""
+    src = (Path(__file__).resolve().parent.parent / "config.py").read_text(encoding="utf-8")
+    assert '_env_bool("PAPER_TRADING", True)' in src
+    assert '_env_bool("USE_LOCAL_TX_BUILD", False)' in src
+    assert '_env_bool("LOCAL_TX_LAYOUT_VERIFIED", False)' in src
+    assert "Refusing to inject synthetic tokens in LIVE mode" in (
+        Path(__file__).resolve().parent.parent / "main.py"
+    ).read_text(encoding="utf-8")

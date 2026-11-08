@@ -19,11 +19,16 @@ from loguru import logger
 
 from analyzer.auto_tuner import auto_tuner
 from analyzer.counterfactual import counterfactual
+from analyzer.regime_filter import regime_filter
 from analyzer.rug_memory import rug_memory
+from analyzer.signal_fusion import compute_fusion
 from config import (
     ATH_RATIO_REJECT_BELOW,
     BUY_COOLDOWN_SECONDS,
     DEAD_HOURS_UTC,
+    FUSION_ENABLED,
+    FUSION_MAX_BONUS,
+    FUSION_MAX_PENALTY,
     MAX_BONDING_CURVE_PCT,
     MAX_INITIAL_BUY_SOL,
     NAME_BLACKLIST_SUBSTRINGS,
@@ -41,6 +46,8 @@ from detector.influencer_monitor import influencer_monitor
 from detector.pumpfun_tracker import get_pumpfun_state
 from detector.social_monitor import get_social_stats
 from detector.wallet_intel import wallet_intel
+from detector.whale_tracker import whale_tracker
+from detector.x_feed import x_feed
 
 
 class SignalScorer:
@@ -134,21 +141,64 @@ class SignalScorer:
             if influencer_monitor.is_mentioned(symbol):
                 token["influencer_mention"] = influencer_monitor.get_mention(symbol)
 
+            # X-feed bridge — tails the standalone x-monitor JSONL output and
+            # exposes a single boolean. Fed to BOTH the four-factor community
+            # score and the fusion engine so X hype can compound when it
+            # aligns with on-chain accumulation.
+            try:
+                if x_feed.has_hype_for(token):
+                    token["x_hype_match"] = True
+            except Exception as e:
+                logger.debug(f"[X-FEED] lookup err for {symbol}: {e}")
+
+            # Cache smart-buyer count on the token so the four-factor scorer
+            # and fusion engine read the same value (and we only hit
+            # wallet_intel once per token).
+            if mint:
+                token["smart_buyer_count"] = len(wallet_intel.smart_buyers_in_window(mint))
+                # Whale wallets are different from smart wallets — classified
+                # by SOL VOLUME not win-rate. A whale buying early says "real
+                # money decided this is worth a position" which is independent
+                # signal from the smart-money/win-rate classifier.
+                token["whale_buyer_count"]  = len(whale_tracker.whale_buyers_in_window(mint))
+                token["whale_buy_volume"]   = whale_tracker.whale_buy_volume(mint)
+
             score, breakdown = self._compute_score(token)
-            # Stash the RAW (pre-rug-penalty) score so:
+            # Stash the RAW (pre-rug-penalty, pre-fusion) score so:
             #   - rug_memory record + lookup use the SAME bucket key (otherwise
             #     records go in at post-penalty bins and lookups fire at
             #     pre-penalty bins → matches never happen, feature dead)
             #   - downstream logging can show both raw and effective scores
+            #   - fusion changes don't shift the rug_memory bin boundaries
             token["raw_score"] = score
+
+            # Signal fusion: bonus/penalty when independent signals co-fire.
+            # Applied AFTER the four-factor sum so it shows up cleanly in
+            # the breakdown for counterfactual attribution. Capped at
+            # ±FUSION_MAX_BONUS/PENALTY so it can't dominate the score.
+            if FUSION_ENABLED:
+                fusion_delta, fusion_breakdown = compute_fusion(
+                    token, FUSION_MAX_BONUS, FUSION_MAX_PENALTY,
+                )
+                if fusion_delta != 0:
+                    breakdown["fusion"]      = fusion_delta
+                    token["fusion_patterns"] = fusion_breakdown
+                    score = max(0, min(100, score + fusion_delta))
 
             # Rug-pattern memory: if this candidate's feature signature has
             # rugged repeatedly in the past, dock the score. Penalty is 0
             # when there's no match (or fewer than MATCH_MIN_RUGS).
+            #
+            # MUST use token["raw_score"] (pre-fusion, pre-penalty) here.
+            # risk/manager.py:close_position records under pos.raw_score,
+            # so the lookup bucket key has to match the record bucket key
+            # or the feature silently no-ops. This is the cf89f61 contract;
+            # the previous code regressed once fusion landed because `score`
+            # here had already been mutated by fusion.
             rug_features = {
                 "initial_buy_sol":   token.get("initial_buy_sol", 0),
                 "bonding_curve_pct": token.get("bonding_curve_pct", 0),
-                "score":             score,   # use RAW score for the bucket key
+                "score":             token["raw_score"],
             }
             rug_penalty = rug_memory.score_penalty(rug_features)
             if rug_penalty > 0:
@@ -165,17 +215,22 @@ class SignalScorer:
 
             curve_pct = token.get("bonding_curve_pct", 0)
             rug_note  = f" | RUG-MATCH ×{token.get('rug_pattern_matches', 0)} (-{rug_penalty})" if rug_penalty else ""
+            fusion_note = ""
+            if breakdown.get("fusion"):
+                pats = ",".join(token.get("fusion_patterns", {}).keys())
+                fusion_note = f" | FUSION {breakdown['fusion']:+d} ({pats})"
             logger.info(
                 f"[SCORE] {symbol} | {mint[:8]}... | Score: {score}/100 | "
                 f"Curve: {curve_pct:.1f}% | "
                 f"MC: {token.get('market_cap_sol', 0):.1f}S | "
                 f"Creator: {token.get('initial_buy_sol', 0):.2f}S"
+                f"{fusion_note}"
                 f"{rug_note}"
             )
 
             # Hard filters first
             if not self._passes_hard_filters(token):
-                logger.debug(f"[FILTERED] {symbol}: {token.get('reject_reason')}")
+                logger.info(f"[FILTERED] {symbol}: {token.get('reject_reason')}")
                 # Counterfactual: log this rejection so we can later check what
                 # the token actually did. If our filters are filtering winners,
                 # this surfaces it.
@@ -212,10 +267,15 @@ class SignalScorer:
             # most expensive filter. If top 10 hold > threshold, it's a rug risk.
             if self._rpc_session is not None:
                 pct = await get_top10_concentration(self._rpc_session, mint)
+                if pct is None:
+                    token["reject_reason"] = "top10_unknown"
+                    logger.info(f"[FILTERED] {symbol}: holder concentration unknown")
+                    counterfactual.record_rejection(token, "top10_unknown")
+                    return
                 token["top10_holder_pct"] = round(pct, 1)
                 if concentration_too_high(pct):
                     token["reject_reason"] = f"top10_{pct:.0f}pct"
-                    logger.debug(f"[FILTERED] {symbol}: top 10 hold {pct:.1f}% (>limit)")
+                    logger.info(f"[FILTERED] {symbol}: top 10 hold {pct:.1f}% (>limit)")
                     counterfactual.record_rejection(token, "top10_concentration")
                     return
 
@@ -225,7 +285,7 @@ class SignalScorer:
                 # authority; anything else is a clear rug-vector.
                 if not await self._freeze_authority_safe(mint):
                     token["reject_reason"] = "freeze_authority_set"
-                    logger.debug(f"[FILTERED] {symbol}: freeze authority set")
+                    logger.info(f"[FILTERED] {symbol}: freeze authority set")
                     counterfactual.record_rejection(token, "freeze_authority_set")
                     return
 
@@ -241,7 +301,7 @@ class SignalScorer:
         Pump.fun mints normally have a null freeze authority. If it's set,
         whoever holds it can freeze your associated token account after the
         buy lands — preventing you from selling. Classic honeypot rug vector.
-        Fail-open on RPC errors so a flaky RPC doesn't shut down trading.
+        Missing data and RPC errors are unsafe: skip the buy.
         """
         try:
             payload = {
@@ -252,24 +312,35 @@ class SignalScorer:
                 RPC_URL, json=payload, timeout=aiohttp.ClientTimeout(total=4)
             ) as r:
                 data = await r.json()
+            if not isinstance(data, dict) or data.get("error"):
+                return False
             val = (data.get("result") or {}).get("value")
             if not val:
-                return True  # account not visible yet — let it through
+                return False
             info = ((val.get("data") or {}).get("parsed") or {}).get("info") or {}
+            if "freezeAuthority" not in info:
+                return False
             return info.get("freezeAuthority") in (None, "")
         except Exception:
-            return True  # fail-open on RPC errors
+            return False
 
     # ── Hard Filters ──────────────────────────────────────────────────────────
     def _passes_hard_filters(self, token: dict) -> bool:
         # Diurnal filter — skip dead hours (UTC). Cheapest reject, do first.
         if DEAD_HOURS_UTC is not None:
-            hour_utc = datetime.datetime.utcnow().hour
+            hour_utc = datetime.datetime.now(datetime.UTC).hour
             start, end = DEAD_HOURS_UTC
             in_window = (start <= hour_utc < end) if start < end else (hour_utc >= start or hour_utc < end)
             if in_window:
                 token["reject_reason"] = f"dead_hours_{hour_utc:02d}utc"
                 return False
+
+        # Regime filter — data-driven version of the dead-hours window. Pauses
+        # buys when the trailing 60-min new-mint rate has collapsed relative to
+        # the 24h median. Bootstrap-safe: no-op until enough history accrues.
+        if regime_filter.should_pause():
+            token["reject_reason"] = "regime_dead"
+            return False
 
         # Symbol/name blacklist — pattern-rugs
         symbol = (token.get("symbol", "") or "").strip().upper()
@@ -295,22 +366,64 @@ class SignalScorer:
             token["reject_reason"] = "creator_blacklisted"
             return False
 
-        # Tier 4: known sniper-bot creator (50+ pump.fun mints bought)
-        if creator and wallet_intel.is_bot_wallet(creator):
-            token["reject_reason"] = f"bot_creator_{wallet_intel.wallet_buys(creator)}"
+        # Rug-pattern hard reject: this signature has rugged on us N+ times.
+        # The score-penalty path (in scoring above) is the soft nudge; this
+        # is the hard floor — if the pattern has burned us repeatedly, don't
+        # buy no matter how shiny the rest of the score looks. Threshold and
+        # sensitivity are env-tunable (RUG_HARD_REJECT_MATCHES,
+        # RUG_MATCH_MIN_RUGS in config.py).
+        rug_features = {
+            "initial_buy_sol":   token.get("initial_buy_sol", 0),
+            "bonding_curve_pct": token.get("bonding_curve_pct", 0),
+            # MUST be raw_score (pre-fusion, pre-penalty) so the lookup
+            # bucket matches what record_rug() stored. See cf89f61 contract.
+            "score":             token.get("raw_score", token.get("score", 0)),
+        }
+        n_rugs = rug_memory.should_hard_reject(rug_features)
+        if n_rugs:
+            token["reject_reason"] = f"rug_pattern_overload_{n_rugs}"
             return False
 
-        # Tier 4: bundled launch (2+ non-creator wallets bought in first 4s)
+        # Tier 4: noise-bot creator (Plan A 2026-05-10). Was: reject if creator
+        # had ≥25 buys. Now: reject only if creator is *classified* noise — a
+        # smart wallet at ≥25 buys is the signal we want, not a filter target.
+        # Wallets with ≥25 buys but no outcome record yet (unknown class) keep
+        # the legacy reject so we don't regress on uncharacterized bot pools.
         mint = token.get("mint", "")
-        if mint and wallet_intel.is_bundled_launch(mint):
-            token["reject_reason"] = "bundled_launch"
-            return False
+        if creator and wallet_intel.is_bot_wallet(creator):
+            cclass = wallet_intel.wallet_class(creator)
+            if cclass == "noise" or cclass == "unknown":
+                token["reject_reason"] = (
+                    f"noise_creator_{wallet_intel.wallet_buys(creator)}"
+                    if cclass == "noise"
+                    else f"bot_creator_{wallet_intel.wallet_buys(creator)}"
+                )
+                return False
+            # cclass == "smart": fall through; the smart-money bonus in
+            # _compute_score will see this creator as a positive signal.
 
-        # Tighter sniper-target check: any KNOWN bot wallet was among the first
-        # buyers (fires for single bots — bundle threshold needs 2+).
+        # Tier 4: bundled launch. Was: reject if 5+ early buyers (coordination
+        # signal). Now: only reject if fewer than 2 of those early buyers are
+        # smart wallets — a bundle of smart money is curated, not coordinated.
+        if mint and wallet_intel.is_bundled_launch(mint):
+            n_smart = len(wallet_intel.smart_buyers_in_window(mint))
+            if n_smart < 2:
+                token["reject_reason"] = "bundled_launch"
+                return False
+
+        # Tier 4: known noise wallet was an early buyer. Was: any bot wallet
+        # tripped the reject. Now: only reject if a noise wallet bought AND
+        # no smart wallet bought — a smart wallet in the window outranks the
+        # noise wallet's negative signal.
         if mint and wallet_intel.has_bot_buyer(mint):
-            token["reject_reason"] = "bot_buyer_in_window"
-            return False
+            n_smart = len(wallet_intel.smart_buyers_in_window(mint))
+            n_noise = len(wallet_intel.noise_buyers_in_window(mint))
+            # Unknown bot-class wallets (no outcome record yet) still count as
+            # noise for backward compatibility — they're what legacy is_bot
+            # was matching against.
+            if n_smart == 0 or n_noise > n_smart:
+                token["reject_reason"] = "bot_buyer_in_window"
+                return False
 
         # ATH-ratio reject — token already dumped from peak; we'd be top-buying.
         # Only fires when tracker has data (pf_ath_ratio > 0).
@@ -336,7 +449,20 @@ class SignalScorer:
             token["reject_reason"] = f"whale_init_{initial_buy:.1f}S"
             return False
 
-        # Symbol/name sanity check
+        # Symbol/name sanity check — RE-ENABLED 2026-05-14 after live
+        # observation that `???`-symbol tokens consistently produce
+        # impossible PnL (+30,000%, +21,000%, +3,200%) because they
+        # migrate to Raydium within seconds, the bonding-curve PDA
+        # closes, and the fallback price feeds (Jupiter / DexScreener)
+        # return corrupted quotes from thin/manipulated post-migration
+        # pools. The earlier holdout audit measured 0% rug rate for
+        # these — but that was using the same corrupted feed: fake
+        # "moonshot" PnL was being counted as a win.
+        #
+        # Real-world impact in a 12h live-paper run on this filter
+        # being off: 17/33 trades were `???` mints accounting for
+        # ~12 SOL of fake credited wins on a 2.5 SOL bankroll.
+        # Real-symbol trades in the same run produced honest PnL.
         if not token.get("symbol") or token.get("symbol") == "???":
             token["reject_reason"] = "no_symbol"
             return False
@@ -398,6 +524,43 @@ class SignalScorer:
                 logger.debug(f"[CREATOR BONUS] {symbol} creator={creator[:8]} +{bonus}")
             elif bonus < 0:
                 logger.debug(f"[CREATOR PENALTY] {symbol} creator={creator[:8]} {bonus}")
+
+        # Smart-money bonus (Plan A 2026-05-10). Known-winning wallets buying
+        # in the first 10s are the highest-signal entry we have. Cap at +15
+        # so it can't single-handedly clear the factor-1 ceiling.
+        mint = token.get("mint", "")
+        if mint:
+            smart_count = len(wallet_intel.smart_buyers_in_window(mint))
+            if smart_count >= 2:
+                creator_score += 15
+                logger.debug(f"[SMART-MONEY] {symbol} mint={mint[:8]} +15 ({smart_count} smart buyers)")
+            elif smart_count == 1:
+                creator_score += 8
+                logger.debug(f"[SMART-MONEY] {symbol} mint={mint[:8]} +8 (1 smart buyer)")
+            # Smart creator (passed the noise reject) also bumps the score
+            if creator and wallet_intel.is_smart_wallet(creator):
+                creator_score += 8
+                logger.debug(f"[SMART-MONEY] {symbol} smart creator={creator[:8]} +8")
+
+            # Whale-buyer bonus — separate signal from smart-money. A whale
+            # is a volume classifier ("real money decided this is worth a
+            # position"); a smart wallet is a win-rate classifier. They can
+            # overlap, but the bonuses are independent on purpose: when
+            # both fire we WANT the score to reflect the conjunction.
+            whale_count = int(token.get("whale_buyer_count", 0))
+            whale_vol   = float(token.get("whale_buy_volume", 0))
+            if whale_count >= 2 or whale_vol >= 3.0:
+                creator_score += 10
+                logger.debug(
+                    f"[WHALE] {symbol} mint={mint[:8]} +10 "
+                    f"({whale_count} whale buyers, {whale_vol:.2f} SOL)"
+                )
+            elif whale_count == 1:
+                creator_score += 5
+                logger.debug(
+                    f"[WHALE] {symbol} mint={mint[:8]} +5 "
+                    f"(1 whale buyer, {whale_vol:.2f} SOL)"
+                )
 
         breakdown["creator"] = max(0, min(creator_score, 25))
 
@@ -479,6 +642,13 @@ class SignalScorer:
         if token.get("influencer_mention"):
             community_score += 10
             logger.debug(f"[INFLUENCER] {symbol} influencer mention bonus +10")
+        elif token.get("x_hype_match"):
+            # X-feed match without a curated influencer hit — smaller
+            # bonus since the source is generic X hype, not a tracked
+            # account. The fusion engine compounds this further when it
+            # aligns with smart-money or comment velocity.
+            community_score += 4
+            logger.debug(f"[X-HYPE] {symbol} x-monitor hype match +4")
 
         # Fresh launch floor — give minimum so new tokens aren't zero-scored
         if token.get("age_minutes", 99) < 1 and community_score == 0:

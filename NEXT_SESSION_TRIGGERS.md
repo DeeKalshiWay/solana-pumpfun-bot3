@@ -164,8 +164,119 @@ When operator returns and starts a new session:
 3. If any condition is MET, surface it: "Hey, Trigger N has fired — ready to ship the work it gates?"
 4. If none fired: don't bring it up unless asked.
 
+## Trigger 5 — Graduation sniper Telegram alerts — ✅ SHIPPED 2026-07-22
+
+Built in `tools/grad_alerts.py`, wired into `tools/graduation_sniper.py`.
+Covers all three items from the original spec:
+
+- **Events**: open / close / whipsaw (`post_stop_grad`), plus a new
+  orphaned-sell alert (see the PLEROMA bug in the scalp-rewire notes).
+- **Daily digest** at 00:00 UTC: balance, win rate, exit-reason split, shadow
+  completion, tail-hold ledger. Reads the trades log lazily — only when the
+  digest actually fires, never on the 5-second manage tick.
+- **Dead-man**, watching PROGRESS rather than liveness, which is the failure
+  mode a process watchdog structurally cannot see:
+  - no successful curve poll for 10 min → feed is dead
+  - no hot-zone discovery for 30 min → discovery is dead
+  - tokens tracked but nothing judged for 3 h → judging pipeline stalled
+  Re-alerts at most hourly per condition. Silent when there is nothing to
+  judge (an empty tracker set is a quiet market, not a fault).
+
+`TELEGRAM_BOT_TOKEN` / `TELEGRAM_OWNER_CHAT_ID` verified present in `.env`.
+Set `GRAD_ALERTS=0` to mute. Alerts swallow all their own exceptions —
+`tests/test_graduation_scalp.py` asserts an alert-transport failure cannot
+reach the trading loop.
+
+Still the watchdog's job: alerting on the process being **dead**. This module
+cannot report its own death. Keep `run_graduation_forever.ps1` paired with it.
+
+<details>
+<summary>Original trigger spec (for reference)</summary>
+
+### Wait condition
+
+ANY of:
+- Operator asks about the graduation sniper's status/results in a future session
+  (remind them this is pending before reporting)
+- The graduation sniper is found dead/silent again (this is exactly what alerts prevent —
+  it already cost 4 days of samples when the July 12 Windows Update reboot killed it silently)
+- Graduation strategy goes LIVE with real SOL (alerts become risk management, not QoL — do not go live without them)
+- Operator explicitly says "ship graduation telegram alerts"
+
+### What to build (~1 hour, pre-approved 2026-07-16)
+
+Wire `tools/graduation_sniper.py` + `tools/grad_tail.py` into the existing
+`logger/telegram_alerts.py` module (already used by the main bot):
+- open/close/whipsaw (`post_stop_grad`) events in real time
+- daily digest (balance, win rate, shadow completion rate, tail-hold ledger)
+- **dead-man alert**: no heartbeat for 10 min, or zero entries AND zero skips
+  for N hours during active market hours (catches the PumpPortal-style silent
+  degradation a process watchdog cannot)
+
+### How to verify the trigger fired
+
+```bash
+cd /c/Users/denni/OneDrive/Desktop/pump.bot2.0 && python -m tools.grad_report
+# if PROCESS shows "NO OUTPUT FOR ..." -> the dead-man condition already fired
+```
+
+</details>
+
+---
+
+## Trigger 6 — Scalp-only readout (opened 2026-07-22)
+
+### Wait condition
+
+**30 closed trades** at the scalp-only config (band [80.0, 81.0), exit 83.5,
+stall-stop off, disaster 5.0). That is the point at which the win rate has a
+usable standard error.
+
+### What to check
+
+The rewire is a bet on a specific, falsifiable claim: that the book lost on
+exit structure rather than on entry quality. The evidence for it was that 88%
+of entered mints graduated while the book still lost 0.77 SOL. If that claim is
+right, these should all move together:
+
+| metric | before | expected after |
+|---|---|---|
+| win rate | 33% | > 60% |
+| migration exits | 30% of closes | < 10% |
+| stall stops | 15 (-0.343 SOL) | 0 (disabled) |
+| avg win | +1.7% | +2.0% to +3.3% |
+| entries with no runway | 11 of 55 | 0 |
+
+**If the win rate is above 60% but the book is still negative**, the tail is the
+problem, not the structure — look at the disaster-stop fills, and consider
+whether 0.25 SOL is too large for a 7% death rate.
+
+**If the win rate is still near 33%**, the entry-quality claim was wrong and the
+strategy should be halted rather than tuned further. Do not add gates.
+
+```bash
+cd /c/Users/denni/OneDrive/Desktop/pump.bot2.0 && python -m tools.grad_report
+```
+
+---
+
+## Trigger 7 — Wire go_live_gate to the graduation book (opened 2026-07-22)
+
+`analytics/go_live_gate.py` reads the MAIN bot's trade DB and reports
+"no trades on disk yet" for criteria 1-3. It has never evaluated the
+graduation strategy, so the gate that is supposed to guard going live is blind
+to the only strategy being actively developed. Wire it to
+`logs/graduation_trades.jsonl` before any live-capital discussion.
+
+No wait condition — ship whenever there is bandwidth. Blocking for go-live.
+
+---
+
 Operator prompts that bypass triggers:
 - "ship Jito bundles" → Trigger 1
 - "ship Option 2 LaserStream scaffold" → Trigger 2
 - "fix the TP partial-sell PnL tracking" → Trigger 3
 - "ship rugcheck pre-buy" → Trigger 4
+- ~~"ship graduation telegram alerts" → Trigger 5~~ (shipped 2026-07-22)
+- "read out the scalp results" → Trigger 6
+- "wire the go-live gate to graduation" → Trigger 7
