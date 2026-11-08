@@ -171,6 +171,11 @@ RPC_URLS = _load_rpc_urls()
 # Anchor IDL that wasn't directly verified when the builder was written.
 # See trader/local_tx_builder.py docstring for the validation procedure.
 USE_LOCAL_TX_BUILD = _env_bool("USE_LOCAL_TX_BUILD", False)
+# Second latch. The local builder's account list has not been byte-diffed
+# against the current pump.fun program, and it targets the legacy token
+# program rather than Token-2022. Both flags must be true before a local
+# transaction is even attempted. Leave this false.
+LOCAL_TX_LAYOUT_VERIFIED = _env_bool("LOCAL_TX_LAYOUT_VERIFIED", False)
 
 # Compute Budget knobs for the local tx path. pump.fun swaps are simple
 # and fit easily in 200K CU; the CU PRICE (in micro-lamports per CU) is

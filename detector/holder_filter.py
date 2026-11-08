@@ -20,10 +20,12 @@ _cache: dict = {}      # mint -> (timestamp, top10_pct)
 _CACHE_TTL = 60        # seconds
 
 
-async def get_top10_concentration(session: aiohttp.ClientSession, mint: str) -> float:
+async def get_top10_concentration(session: aiohttp.ClientSession, mint: str) -> float | None:
     """
-    Returns the percentage of supply held by top 10 token accounts.
-    Returns 0 on RPC failure (treat as unknown — don't reject).
+    Percentage of supply held by the top 10 token accounts.
+
+    None means the check could not be completed. Callers must skip the
+    buy in that case. A numeric 0 is a real reading, not a failure.
     """
     now = time.time()
     cached = _cache.get(mint)
@@ -54,13 +56,15 @@ async def get_top10_concentration(session: aiohttp.ClientSession, mint: str) -> 
         ) as r2:
             supply = await r2.json()
 
-        accounts = largest.get("result", {}).get("value", []) or []
-        total    = supply.get("result", {}).get("value", {}).get("amount")
-        if not accounts or not total:
-            return 0
+        if "error" in largest or "error" in supply:
+            return None
+        accounts = (largest.get("result") or {}).get("value")
+        total    = ((supply.get("result") or {}).get("value") or {}).get("amount")
+        if accounts is None or not total:
+            return None
         total_int = int(total)
         if total_int == 0:
-            return 0
+            return None
 
         # Sum top 10 by raw amount
         top10_amount = 0
@@ -76,10 +80,10 @@ async def get_top10_concentration(session: aiohttp.ClientSession, mint: str) -> 
         return pct
 
     except TimeoutError:
-        return 0
+        return None
     except Exception as e:
         logger.debug(f"[HOLDER] {mint[:8]} concentration check error: {e}")
-        return 0
+        return None
 
 
 def concentration_too_high(pct: float) -> bool:

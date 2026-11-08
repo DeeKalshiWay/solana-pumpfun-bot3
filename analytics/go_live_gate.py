@@ -218,7 +218,8 @@ def main() -> int:
             print(f"  VERDICT: ·  INSUFFICIENT DATA ({nones} criterion not yet evaluable)")
         return 2
     if not args.json:
-        print("  VERDICT: ✓  GO — all 5 criteria pass")
+        print("  VERDICT: criteria pass. This is NOT authorization to use funds")
+        print("  and NOT evidence of a repeatable edge. In-sample stats lie.")
     return 0
 
 

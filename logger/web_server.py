@@ -45,8 +45,11 @@ def _get_lan_ip() -> str:
 
 
 WEB_DIR  = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web")
-WEB_HOST = "0.0.0.0"   # listen on all interfaces (LAN-accessible)
+# Loopback unless the operator sets DASHBOARD_HOST. Control POSTs can
+# emergency-stop the bot and force-sell positions.
+WEB_HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
 WEB_PORT = 8765
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 # Optional HTTP Basic Auth. If both env vars are set, every dashboard route
 # (HTML, API, control POSTs) requires the credentials. Recommended whenever
@@ -55,6 +58,13 @@ WEB_PORT = 8765
 _AUTH_USER = os.environ.get("DASHBOARD_AUTH_USER", "")
 _AUTH_PASS = os.environ.get("DASHBOARD_AUTH_PASS", "")
 _AUTH_ENABLED = bool(_AUTH_USER and _AUTH_PASS)
+
+
+def dashboard_bind_allowed(host: str | None = None, auth_enabled: bool | None = None) -> bool:
+    """Non-loopback binds require both dashboard auth env vars."""
+    chosen = WEB_HOST if host is None else host
+    authed = _AUTH_ENABLED if auth_enabled is None else auth_enabled
+    return chosen in _LOOPBACK_HOSTS or bool(authed)
 
 
 def _check_basic_auth(header_value: str) -> bool:
@@ -339,6 +349,13 @@ class WebDashboard:
         return resp
 
     async def run(self):
+        if not dashboard_bind_allowed():
+            logger.critical(
+                "Refusing to start the dashboard on {} without "
+                "DASHBOARD_AUTH_USER and DASHBOARD_AUTH_PASS.",
+                WEB_HOST,
+            )
+            return
         app = web.Application(middlewares=[self._auth_middleware, self._cors_middleware])
         app.router.add_get("/",              self.index)
         app.router.add_get("/api/status",    self.api_status)

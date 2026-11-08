@@ -76,7 +76,10 @@ MAX_FORCE_SELL_ATTEMPTS = 10
 # current_price hasn't been refreshed within this many seconds. Without
 # this guard a stale price (price_monitor lag) inflates equity during
 # rapid drops and the emergency drawdown trigger fires late.
-STALE_PRICE_SEC = 10.0
+# A price older than this is not a mark. 30s covers a short RPC blip
+# without treating deployed capital as a total loss (a 10s window
+# false-tripped the emergency stop whenever the book was full).
+STALE_PRICE_SEC = 30.0
 
 
 @dataclass
@@ -263,13 +266,24 @@ class RiskManager:
         the killer, not absolute deploy size."""
         return self.starting_sol_balance * (MAX_SYMBOL_LIFETIME_DEPLOY_PCT / 100.0)
 
-    def _would_breach_symbol_cap(self, symbol: str, sol_amount: float) -> bool:
+    @staticmethod
+    def _deploy_key(symbol: str | None, creator: str | None = None) -> str:
+        """Lifetime cap key. Same creator relaunching a ticker shares a
+        bucket. Two unrelated creators using the same ticker do not."""
+        if not symbol:
+            return ""
+        if creator:
+            return f"{creator}|{symbol}"
+        return symbol
+
+    def _would_breach_symbol_cap(self, symbol: str, sol_amount: float, creator: str | None = None) -> bool:
         if MAX_SYMBOL_LIFETIME_DEPLOY_PCT >= 999:
             return False
         cap = self._symbol_cap_sol()
         if cap <= 0:
             return False
-        already = self._symbol_deployed.get(symbol, 0.0)
+        key = self._deploy_key(symbol, creator)
+        already = self._symbol_deployed.get(key, 0.0)
         return (already + sol_amount) > cap
 
     def _load_or_seed_starting_balance(self, current_balance: float) -> float:
@@ -479,7 +493,7 @@ class RiskManager:
 
     # ── Position sizing ───────────────────────────────────────────────────────
     async def calculate_position_size(
-        self, score: int, symbol: str | None = None,
+        self, score: int, symbol: str | None = None, creator: str | None = None,
     ) -> tuple[float, str]:
         """Return (size_sol, reject_reason).
 
@@ -504,8 +518,8 @@ class RiskManager:
 
         # Per-symbol lifetime cap (concentration audit fix). Optional symbol
         # arg keeps backward-compat — callers that don't pass it skip the check.
-        if symbol and self._would_breach_symbol_cap(symbol, 0.0):
-            already = self._symbol_deployed.get(symbol, 0)
+        if symbol and self._would_breach_symbol_cap(symbol, 0.0, creator):
+            already = self._symbol_deployed.get(self._deploy_key(symbol, creator), 0)
             logger.warning(
                 f"[SYMBOL CAP] {symbol} | lifetime deploy {already:.4f} SOL "
                 f">= cap {self._symbol_cap_sol():.4f} ({MAX_SYMBOL_LIFETIME_DEPLOY_PCT}% of start) — no new buy"
@@ -542,7 +556,7 @@ class RiskManager:
         # Clip to remaining per-symbol cap (concentration audit fix).
         if symbol and MAX_SYMBOL_LIFETIME_DEPLOY_PCT < 999:
             cap = self._symbol_cap_sol()
-            sym_remaining = max(0.0, cap - self._symbol_deployed.get(symbol, 0.0))
+            sym_remaining = max(0.0, cap - self._symbol_deployed.get(self._deploy_key(symbol, creator), 0.0))
             if sym_remaining < size:
                 size = sym_remaining
 
@@ -561,6 +575,9 @@ class RiskManager:
     def open_position(self, token: dict, trade_result: dict):
         mint   = token["mint"]
         symbol = token.get("symbol", "???")
+        if mint in self.positions:
+            logger.warning(f"[POSITION] {symbol} — already open, not replacing the book")
+            return
 
         tokens_received = trade_result.get("tokens_expected", 0)
         if tokens_received <= 0:
@@ -593,8 +610,9 @@ class RiskManager:
         # Record lifetime deploy under this symbol for the concentration cap.
         # Symbol-keyed, not mint-keyed: a creator relaunching the same name
         # after a rug counts as the same bucket.
-        if symbol and sol_spent > 0:
-            self._symbol_deployed[symbol] = self._symbol_deployed.get(symbol, 0.0) + sol_spent
+        deploy_key = self._deploy_key(symbol, creator)
+        if deploy_key and sol_spent > 0:
+            self._symbol_deployed[deploy_key] = self._symbol_deployed.get(deploy_key, 0.0) + sol_spent
             self._save_symbol_deployed()
 
         logger.success(
@@ -623,6 +641,7 @@ class RiskManager:
         partial_invested = pos.sol_invested * sell_fraction
         sol_received     = float(sell_result.get("sol_received", 0) or 0)
         pnl_sol          = sol_received - partial_invested
+        leg_pnl_pct      = (pnl_sol / partial_invested * 100) if partial_invested else 0.0
 
         trade_record = {
             "mint":         mint,
@@ -633,7 +652,7 @@ class RiskManager:
             "sol_invested": partial_invested,
             "sol_received": sol_received,
             "pnl_sol":      pnl_sol,
-            "pnl_pct":      pos.pnl_pct,         # at the moment of TP
+            "pnl_pct":      leg_pnl_pct,         # this leg, not the whole position
             "hold_minutes": pos.age_minutes,
             "reason":       sell_result.get("reason", level_id),
             "score":        pos.score,
@@ -684,12 +703,16 @@ class RiskManager:
             # ignoring. None on non-stall exits and on live trades.
             "sol_received_optimistic": sell_result.get("sol_received_optimistic"),
             "exit_latency_s":          sell_result.get("exit_latency_s"),
+            # Abandoned exits still have tokens (or an unknown balance).
+            # The row is a bookkeeping loss, not a confirmed rug.
+            "unreconciled":            bool(sell_result.get("unreconciled")),
         }
+        unreconciled = trade_record["unreconciled"]
         self.closed_trades.append(trade_record)
         self._append_closed_trade(trade_record)   # persist to JSONL
 
         # Feed result back into creator tracker for leaderboard
-        if pos.creator:
+        if pos.creator and not unreconciled:
             creator_tracker.record_trade_result(pos.creator, pnl_sol)
 
         # Smart-money attribution (Plan A 2026-05-10): widen the wallet_intel
@@ -697,10 +720,11 @@ class RiskManager:
         # rejected population. pnl_pct on a closed live trade is a strong
         # outcome signal — better-than-counterfactual since we observed the
         # full trade lifecycle, not just a 10-min snapshot.
-        try:
-            wallet_intel.attribute_outcome(mint, float(pos.pnl_pct))
-        except Exception as e:
-            logger.debug(f"[risk] wallet_intel.attribute_outcome err: {e}")
+        if not unreconciled:
+            try:
+                wallet_intel.attribute_outcome(mint, float(pos.pnl_pct))
+            except Exception as e:
+                logger.debug(f"[risk] wallet_intel.attribute_outcome err: {e}")
 
         # Rug-pattern memory: if this trade rugged, record its fingerprint
         # so future candidates with the same pattern get docked at scoring.
@@ -710,7 +734,7 @@ class RiskManager:
         #      on tiny trades — a 0.01 SOL trade losing 50% is just fee drag)
         # And use RAW score (pre-rug-penalty) so the bucket key matches the
         # one the scorer uses at lookup time.
-        if pos.pnl_pct <= RUG_PNL_THRESHOLD and pnl_sol < -0.005:
+        if (not unreconciled) and pos.pnl_pct <= RUG_PNL_THRESHOLD and pnl_sol < -0.005:
             rug_memory.record_rug(
                 token_features = {
                     "initial_buy_sol":   pos.init_buy_sol,
@@ -816,6 +840,29 @@ class RiskManager:
                 logger.error(f"Risk monitor error: {e}")
             await asyncio.sleep(3)
 
+    def _equity_drawdown_pct(self, current_sol: float) -> float:
+        """Drawdown versus original capital.
+
+        Stale positions are omitted from both sides: their cost basis is
+        subtracted from the baseline and their mark is not added. A dead
+        price feed then does not look like the deployed SOL vanished.
+        Fresh marks still count, so a real dump still trips the stop.
+        """
+        if self.starting_sol_balance <= 0:
+            return 0.0
+        now = time.time()
+        stale_cost = 0.0
+        fresh_value = 0.0
+        for p in self.positions.values():
+            age = now - p.price_updated_at if p.price_updated_at else None
+            if age is None or age > STALE_PRICE_SEC:
+                stale_cost += p.sol_invested
+            else:
+                fresh_value += p.current_price * p.tokens_held
+        adjusted_start = self.starting_sol_balance - stale_cost
+        adjusted_equity = current_sol + fresh_value
+        return ((adjusted_start - adjusted_equity) / self.starting_sol_balance) * 100
+
     def _held_value_for_drawdown(self) -> float:
         """Sum of market value of open positions, BUT positions whose
         price hasn't been refreshed within STALE_PRICE_SEC are treated
@@ -843,7 +890,7 @@ class RiskManager:
         current_sol = await self.wallet.get_sol_balance()
         held_value  = self._held_value_for_drawdown()
         total_equity = current_sol + held_value
-        drawdown = ((self.starting_sol_balance - total_equity) / self.starting_sol_balance) * 100
+        drawdown = self._equity_drawdown_pct(current_sol)
 
         # Already tripped via auto-drawdown: keep retrying force-sells each tick
         # until everything closes. Manual dashboard stop sets emergency_stop_active
@@ -972,6 +1019,9 @@ class RiskManager:
                 pos.tokens_held  = int(pos.tokens_held * (1 - sell_fraction))
                 pos.sol_invested *= (1 - sell_fraction)
                 pos.tp_levels_hit.append(level_id)
+                # The cached sell was built for the pre-partial balance.
+                pos.prebuilt_sell_tx = None
+                pos.prebuilt_sell_ts = 0.0
                 self._save_open_positions()   # disk reflects post-TP state
 
                 if pos.tokens_held <= 0:
@@ -1074,10 +1124,14 @@ class RiskManager:
                 logger.critical(
                     f"[FORCE SELL ABANDONED] {pos.symbol} ({mint[:8]}) | "
                     f"{pos.force_sell_attempts} attempts failed; last error={err} | "
-                    f"DROPPING from positions. Use dump_orphans.py to recover tokens."
+                    f"Recording an unreconciled loss. Tokens may still be in the wallet."
                 )
-                self.positions.pop(mint, None)
-                self._save_open_positions()
+                self.close_position(mint, {
+                    "sol_received": 0.0,
+                    "reason": "abandoned_unsold",
+                    "venue": result.get("venue"),
+                    "unreconciled": True,
+                })
                 return
             logger.warning(
                 f"[FORCE SELL FAILED] {pos.symbol} ({mint[:8]}) | reason={reason} | "

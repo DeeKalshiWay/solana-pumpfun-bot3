@@ -267,6 +267,10 @@ class TradeExecutor:
         return await self.pumpportal.sell(token_mint, token_amount_raw, reason,
                                           price_history=price_history)
 
+    async def confirm_signature(self, signature: str, max_wait: int = 45) -> bool:
+        """Extra confirm window for a buy whose first wait expired."""
+        return await self.pumpportal._confirm(signature, max_wait=max_wait)
+
     async def prebuild_sell_tx(self, token_mint: str) -> bytes | None:
         """Delegate to PumpPortal — only the bonding-curve venue supports the
         prebuild path right now (Jupiter quotes are time-sensitive, can't be

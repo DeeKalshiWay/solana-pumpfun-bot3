@@ -189,10 +189,13 @@ class TestForceSellEscalation:
             assert "MintZ" in rm.positions
             assert rm.positions["MintZ"].force_sell_attempts == i + 1
 
-        # The Nth failure drops the position.
+        # The Nth failure drops the position and writes an unreconciled loss.
         await rm._force_sell("MintZ", "stop_loss")
         assert "MintZ" not in rm.positions
         assert executor.sell_calls == MAX_FORCE_SELL_ATTEMPTS
+        assert len(rm.closed_trades) == 1
+        assert rm.closed_trades[0]["reason"] == "abandoned_unsold"
+        assert rm.closed_trades[0]["unreconciled"] is True
 
 
 # ── Bug F ────────────────────────────────────────────────────────────────────

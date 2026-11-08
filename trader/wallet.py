@@ -110,18 +110,39 @@ class SolanaWallet:
         )
         return 0.0
 
-    async def get_token_balance(self, mint: str) -> float:
-        """Returns token balance for a given SPL mint."""
-        result = await self._rpc("getTokenAccountsByOwner", [
-            str(self.pubkey),
-            {"mint": mint},
-            {"encoding": "jsonParsed"}
-        ])
-        accounts = result.get("result", {}).get("value", [])
+    async def get_token_balance_status(self, mint: str) -> float | None:
+        """UI token amount, or None when the RPC answer is unusable.
+
+        None is not a zero balance. Startup reconciliation must not
+        treat a failed read as an empty account.
+        """
+        try:
+            result = await self._rpc("getTokenAccountsByOwner", [
+                str(self.pubkey),
+                {"mint": mint},
+                {"encoding": "jsonParsed"}
+            ])
+        except Exception as e:
+            logger.warning(f"[WALLET] token balance read failed for {mint[:8]}: {e}")
+            return None
+        if not isinstance(result, dict) or result.get("error") or "result" not in result:
+            return None
+        accounts = (result.get("result") or {}).get("value")
+        if accounts is None:
+            return None
         if not accounts:
             return 0.0
-        info = accounts[0]["account"]["data"]["parsed"]["info"]
-        return float(info["tokenAmount"]["uiAmount"] or 0)
+        try:
+            info = accounts[0]["account"]["data"]["parsed"]["info"]
+            return float(info["tokenAmount"]["uiAmount"] or 0)
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning(f"[WALLET] token balance parse failed for {mint[:8]}: {e}")
+            return None
+
+    async def get_token_balance(self, mint: str) -> float:
+        """Returns token balance for a given SPL mint. 0 if unknown."""
+        bal = await self.get_token_balance_status(mint)
+        return 0.0 if bal is None else bal
 
     async def get_all_token_balances(self) -> dict:
         """Returns all SPL token balances as {mint: amount}."""

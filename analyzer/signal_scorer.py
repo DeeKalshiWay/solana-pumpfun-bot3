@@ -267,6 +267,11 @@ class SignalScorer:
             # most expensive filter. If top 10 hold > threshold, it's a rug risk.
             if self._rpc_session is not None:
                 pct = await get_top10_concentration(self._rpc_session, mint)
+                if pct is None:
+                    token["reject_reason"] = "top10_unknown"
+                    logger.info(f"[FILTERED] {symbol}: holder concentration unknown")
+                    counterfactual.record_rejection(token, "top10_unknown")
+                    return
                 token["top10_holder_pct"] = round(pct, 1)
                 if concentration_too_high(pct):
                     token["reject_reason"] = f"top10_{pct:.0f}pct"
@@ -296,7 +301,7 @@ class SignalScorer:
         Pump.fun mints normally have a null freeze authority. If it's set,
         whoever holds it can freeze your associated token account after the
         buy lands — preventing you from selling. Classic honeypot rug vector.
-        Fail-open on RPC errors so a flaky RPC doesn't shut down trading.
+        Missing data and RPC errors are unsafe: skip the buy.
         """
         try:
             payload = {
@@ -307,13 +312,17 @@ class SignalScorer:
                 RPC_URL, json=payload, timeout=aiohttp.ClientTimeout(total=4)
             ) as r:
                 data = await r.json()
+            if not isinstance(data, dict) or data.get("error"):
+                return False
             val = (data.get("result") or {}).get("value")
             if not val:
-                return True  # account not visible yet — let it through
+                return False
             info = ((val.get("data") or {}).get("parsed") or {}).get("info") or {}
+            if "freezeAuthority" not in info:
+                return False
             return info.get("freezeAuthority") in (None, "")
         except Exception:
-            return True  # fail-open on RPC errors
+            return False
 
     # ── Hard Filters ──────────────────────────────────────────────────────────
     def _passes_hard_filters(self, token: dict) -> bool:

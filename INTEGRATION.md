@@ -75,6 +75,24 @@ Separate research entrypoints, not launched by `main.py`:
 - Tests are the repo's pytest suite. They use temp files and mocks. They do not place trades.
 - `tests/test_paper_executor.py` called `asyncio.get_event_loop()`, which raises on Python 3.12 (the version in `pyproject.toml` and CI). The helper now uses `asyncio.run`. The paper-sell assertions are unchanged.
 
+## Review fixes on this branch
+
+A follow-up pass changed behavior the clean merge had imported as-is:
+
+- A paper sell of zero tokens fails. It no longer closes the position for 0 SOL.
+- Restart reloads token inventory and the last mark into the paper executor.
+- Paper `sol_spent` includes the buy fee and `sol_received` is net of the sell fee, so the trade record matches the wallet.
+- `REALISTIC_PAPER_SIM=0` also disables the stampede multiplier.
+- An unconfirmed live buy is watched and adopted if the signature later confirms.
+- Startup reconciliation reloads the paper book and, on a live wallet, updates token counts only from a successful balance read.
+- Holder concentration and freeze authority fail closed when the read is missing.
+- The dashboard binds to `127.0.0.1` unless auth is configured. An open bind without auth does not start.
+- Giving up on a force-sell writes an `abandoned_unsold` row marked unreconciled, and does not train rug memory from it.
+- Take-profit clears the prebuilt sell. Lifetime symbol caps are per creator plus ticker.
+- The local transaction builder also requires `LOCAL_TX_LAYOUT_VERIFIED` (default false).
+- A stale price no longer counts deployed capital as a realized loss in the emergency-stop drawdown.
+- The go-live gate's pass line says it is not authorization to use funds.
+
 ## Unresolved
 
 - No content conflict left open.

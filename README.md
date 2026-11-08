@@ -27,7 +27,7 @@ underneath; see **Limitations** for an honest read on the strategy.
   rate, multi-tier circuit breakers (loss streak, daily DD, lifetime
   DD), trailing stops with regime switch (tight → moonshot mode),
   no-movement exit, time exit.
-- **Observability.** aiohttp web dashboard at `:8765` with 7 REST
+- **Observability.** aiohttp web dashboard on `127.0.0.1:8765` with 7 REST
   endpoints, hourly equity snapshots, single-page SPA with custom SVG
   equity chart, click-to-pin trade markers, drawdown view.
 - **Test + lint floor.** ruff + mypy + pytest in CI on every push,

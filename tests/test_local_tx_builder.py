@@ -452,14 +452,22 @@ class TestLocalTxEligibility:
         monkeypatch.setattr(pp, "USE_LOCAL_TX_BUILD", False)
         assert pp.PumpPortalExecutor._local_tx_eligible("buy", 0.1, True) is False
 
+    def test_build_flag_alone_is_not_enough(self, monkeypatch):
+        import trader.pumpportal_executor as pp
+        monkeypatch.setattr(pp, "USE_LOCAL_TX_BUILD", True)
+        monkeypatch.setattr(pp, "LOCAL_TX_LAYOUT_VERIFIED", False)
+        assert pp.PumpPortalExecutor._local_tx_eligible("buy", 0.1, True) is False
+
     def test_enabled_buy(self, monkeypatch):
         import trader.pumpportal_executor as pp
         monkeypatch.setattr(pp, "USE_LOCAL_TX_BUILD", True)
+        monkeypatch.setattr(pp, "LOCAL_TX_LAYOUT_VERIFIED", True)
         assert pp.PumpPortalExecutor._local_tx_eligible("buy", 0.1, True) is True
 
     def test_enabled_sell_integer(self, monkeypatch):
         import trader.pumpportal_executor as pp
         monkeypatch.setattr(pp, "USE_LOCAL_TX_BUILD", True)
+        monkeypatch.setattr(pp, "LOCAL_TX_LAYOUT_VERIFIED", True)
         assert pp.PumpPortalExecutor._local_tx_eligible("sell", 1_000_000, False) is True
 
     def test_enabled_sell_percent_string_falls_back(self, monkeypatch):
@@ -467,9 +475,11 @@ class TestLocalTxEligibility:
         resolve that → must say not eligible so the HTTP path handles it."""
         import trader.pumpportal_executor as pp
         monkeypatch.setattr(pp, "USE_LOCAL_TX_BUILD", True)
+        monkeypatch.setattr(pp, "LOCAL_TX_LAYOUT_VERIFIED", True)
         assert pp.PumpPortalExecutor._local_tx_eligible("sell", "100%", False) is False
 
     def test_buy_with_zero_amount_not_eligible(self, monkeypatch):
         import trader.pumpportal_executor as pp
         monkeypatch.setattr(pp, "USE_LOCAL_TX_BUILD", True)
+        monkeypatch.setattr(pp, "LOCAL_TX_LAYOUT_VERIFIED", True)
         assert pp.PumpPortalExecutor._local_tx_eligible("buy", 0, True) is False

@@ -99,7 +99,8 @@ def _price_at_lookback(price_history, lookback_s: float, fallback: float) -> flo
 # ────────────────────────────────────────────────────────────────────────────
 # Tunable realism knobs. Defaults reflect public RPC + small wallet against
 # the modern (2026) pump.fun environment with active competing bots.
-# Set REALISTIC_PAPER_SIM=0 in env to disable all friction (legacy behavior).
+# Set REALISTIC_PAPER_SIM=0 in env to disable slippage, MEV, random
+# tx failures, and the stall-exit stampede multiplier (legacy behavior).
 # ────────────────────────────────────────────────────────────────────────────
 REALISTIC_PAPER_SIM = os.getenv("REALISTIC_PAPER_SIM", "1") == "1"
 
@@ -214,6 +215,9 @@ class PaperExecutor:
     async def stop(self):
         pass
 
+    async def confirm_signature(self, signature: str, max_wait: int = 45) -> bool:
+        return False
+
     def update_price(self, mint: str, price_per_raw: float):
         """Called by price monitor to keep current prices for paper sells."""
         self._prices[mint] = price_per_raw
@@ -282,16 +286,40 @@ class PaperExecutor:
             f"| slip={slip*100:.1f}% mev={mev*100:.1f}% fee={buy_fee:.4f} (curve={curve_sol:.0f} SOL)"
         )
 
+        # sol_spent includes the priority fee already deducted from the
+        # wallet so a later close's pnl matches the wallet delta.
         return {
             "success":         True,
             "signature":       f"PAPER_{token_mint[:8]}_{int(time.time())}",
             "type":            "buy",
             "mint":            token_mint,
-            "sol_spent":       sol_amount,
+            "sol_spent":       sol_amount + buy_fee,
+            "buy_fee":         buy_fee,
             "tokens_expected": tokens_received,
             "venue":           "paper",
             "timestamp":       time.time(),
         }
+
+    def restore_inventory(self, positions: dict) -> int:
+        """Reload token counts and marks after a process restart.
+
+        RiskManager persists positions. This executor's holdings and
+        prices are in-memory, so a new process must copy them back
+        before any sell, or a percent sell resolves to zero tokens.
+        """
+        restored = 0
+        for mint, pos in positions.items():
+            held = int(getattr(pos, "tokens_held", 0) or 0)
+            price = float(getattr(pos, "current_price", 0) or 0)
+            if held <= 0 and price <= 0:
+                continue
+            if held > 0:
+                self._tokens_held[mint] = held
+            if price > 0:
+                self._prices[mint] = price
+            self._curve_sol.setdefault(mint, DEFAULT_CURVE_SOL)
+            restored += 1
+        return restored
 
     async def prebuild_sell_tx(self, token_mint: str) -> bytes | None:
         """Paper mode: no real tx to build. Compat shim so risk_manager's
@@ -337,12 +365,30 @@ class PaperExecutor:
         # sol_received=0 and every partial recorded as a 100% loss of cost
         # basis regardless of the price move.
         token_amount = self._resolve_token_amount(token_mint, token_amount)
+        if token_amount <= 0:
+            # Do not report success. A restart with an empty in-memory
+            # book used to "sell" 100% for 0 SOL and the risk manager
+            # closed the position as a total loss.
+            logger.warning(f"[PAPER SELL 0FILL] {token_mint[:8]} | no tokens to sell")
+            return {
+                "success": False, "error": "zero_amount", "venue": "paper",
+                "type": "sell", "mint": token_mint, "reason": reason,
+                "sol_received": 0.0, "timestamp": time.time(),
+            }
+
+        price_now = self._prices.get(token_mint, 0)
+        if price_now <= 0:
+            logger.warning(f"[PAPER SELL 0FILL] {token_mint[:8]} | no price")
+            return {
+                "success": False, "error": "no_price", "venue": "paper",
+                "type": "sell", "mint": token_mint, "reason": reason,
+                "sol_received": 0.0, "timestamp": time.time(),
+            }
 
         # Sell-side priority fee, scaled to the position's notional value.
         # In live this caps at 5x the buy cap because exit urgency on a rug
         # pays for itself — paper now models the same asymmetry.
-        price_now_for_fee = self._prices.get(token_mint, 0)
-        pos_value = token_amount * price_now_for_fee
+        pos_value = token_amount * price_now
         sell_fee = _sell_priority_fee(pos_value)
         self.wallet.deduct(sell_fee)
 
@@ -362,16 +408,7 @@ class PaperExecutor:
                 "timestamp":    time.time(),
             }
 
-        price_now = self._prices.get(token_mint, 0)
         curve_sol = self._curve_sol.get(token_mint, DEFAULT_CURVE_SOL)
-
-        if price_now <= 0 or token_amount <= 0:
-            logger.warning(f"[PAPER SELL 0FILL] {token_mint[:8]} | no price/amount")
-            return {
-                "success":      True, "venue": "paper", "type": "sell",
-                "mint":         token_mint, "reason": reason,
-                "sol_received": 0.0, "timestamp": time.time(),
-            }
 
         # ── Latency-honest exit pricing ──────────────────────────────────────
         # On stall-class force-sells, our paper fill no longer happens at the
@@ -383,7 +420,11 @@ class PaperExecutor:
         # The lookback can only WORSEN the fill vs the optimistic baseline.
         # Outside the stampede reasons (TP ladder, trailing stop), the latest
         # tick is a fine approximation — those exits aren't herd-correlated.
-        is_stampede = reason in STAMPEDE_REASONS and EXIT_LATENCY_ENABLED
+        is_stampede = (
+            REALISTIC_PAPER_SIM
+            and reason in STAMPEDE_REASONS
+            and EXIT_LATENCY_ENABLED
+        )
         latency_s = _sample_exit_latency_s() if is_stampede else 0.0
         if is_stampede:
             hist_price = _price_at_lookback(price_history, latency_s, fallback=price_now)
@@ -408,8 +449,10 @@ class PaperExecutor:
         total_drag = min(slip + mev + late_tp_penalty, 0.95)
 
         # On exits, slippage REDUCES sol received (vs increasing cost on entries)
-        sol_received = gross_sol * (1 - total_drag)
-        self.wallet.credit(sol_received)
+        gross_received = gross_sol * (1 - total_drag)
+        self.wallet.credit(gross_received)
+        # Report proceeds net of the sell fee so trade pnl matches the wallet.
+        sol_received = gross_received - sell_fee
 
         # Counterfactual: what we'd have credited under the OLD model
         # (latest tick price, no stampede multiplier). Same MEV / late-TP
@@ -450,6 +493,7 @@ class PaperExecutor:
             "mint":                  token_mint,
             "reason":                reason,
             "sol_received":          sol_received,
+            "sell_fee":              sell_fee,
             "sol_received_optimistic": sol_received_optim if is_stampede else None,
             "exit_latency_s":        latency_s if is_stampede else None,
             "venue":                 "paper",

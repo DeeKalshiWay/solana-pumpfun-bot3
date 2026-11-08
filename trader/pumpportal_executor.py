@@ -18,6 +18,7 @@ from config import (
     BUY_SLIPPAGE_BPS,
     COMPUTE_UNIT_LIMIT,
     COMPUTE_UNIT_PRICE_MICROLAMPORTS,
+    LOCAL_TX_LAYOUT_VERIFIED,
     PRIORITY_FEE_SOL,
     RPC_URL,
     RPC_URLS,
@@ -170,7 +171,7 @@ class PumpPortalExecutor:
         """Decide whether the local builder can handle this (action, amount)
         combination. Conservative: any unsupported shape falls back to
         the PumpPortal HTTP path."""
-        if not USE_LOCAL_TX_BUILD:
+        if not USE_LOCAL_TX_BUILD or not LOCAL_TX_LAYOUT_VERIFIED:
             return False
         if action == "buy":
             # buys always denominated in SOL; amount is the SOL float.

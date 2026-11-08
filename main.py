@@ -123,6 +123,90 @@ async def _prebuild_sell_for_position(executor, risk_manager, mint: str):
         logger.debug(f"[PREBUILD] failed for {mint[:8]}: {e}")
 
 
+async def reconcile_positions(risk_manager, wallet, executor, paper: bool) -> None:
+    """Paper: reload in-memory inventory from the restored book.
+
+    Live: if the chain reports a positive balance that disagrees with
+    the book, trust the chain. Unknown reads are left alone. A confirmed
+    zero is logged and left open so a later sell can still be attempted
+    instead of silently booking a fake loss during an RPC miss.
+    """
+    if paper:
+        restore = getattr(executor, "restore_inventory", None)
+        if restore is not None:
+            n = restore(risk_manager.positions)
+            if n:
+                logger.warning(f"[RECONCILE] Restored paper inventory for {n} position(s)")
+        return
+
+    status_fn = getattr(wallet, "get_token_balance_status", None)
+    if status_fn is None:
+        return
+    for mint, pos in list(risk_manager.positions.items()):
+        bal = await status_fn(mint)
+        if bal is None:
+            logger.error(f"[RECONCILE] {pos.symbol} balance unknown; book unchanged")
+            continue
+        raw = int(round(bal * 1_000_000))
+        if raw <= 0:
+            logger.critical(
+                f"[RECONCILE] {pos.symbol} ({mint[:8]}) confirmed 0 tokens on chain; "
+                "position stays open until a sell resolves it"
+            )
+            continue
+        if raw != pos.tokens_held:
+            logger.warning(
+                f"[RECONCILE] {pos.symbol} book {pos.tokens_held} -> chain {raw}"
+            )
+            pos.tokens_held = raw
+            risk_manager._save_open_positions()
+
+
+async def _adopt_landed_buy(
+    executor, risk_manager, wallet, token: dict, result: dict,
+    resolve_delay: float = 2.0, resolve_retries: int = 4,
+) -> None:
+    """If an unconfirmed buy later lands, open the position.
+
+    The first confirm window can expire while the transaction is still
+    in flight. Leaving it untracked spends SOL with no stop and no TP.
+    """
+    sig = result.get("signature")
+    mint = token.get("mint", "")
+    if not sig or not mint or mint in risk_manager.positions:
+        return
+    confirm = getattr(executor, "confirm_signature", None)
+    if confirm is None:
+        return
+    try:
+        ok = await confirm(sig)
+    except Exception as e:
+        logger.error(f"[ADOPT] confirm failed for {mint[:8]}: {e}")
+        return
+    if not ok or mint in risk_manager.positions:
+        return
+    adopted = dict(result)
+    adopted["success"] = True
+    adopted["error"] = None
+    if int(adopted.get("tokens_expected") or 0) <= 0:
+        await _resolve_tokens_received(
+            adopted, mint, wallet, retries=resolve_retries, delay=resolve_delay,
+        )
+    if int(adopted.get("tokens_expected") or 0) <= 0:
+        logger.critical(
+            f"[ADOPT] {token.get('symbol', mint[:8])} buy {sig[:12]} landed "
+            "but token amount is still unknown"
+        )
+        return
+    if mint in risk_manager.positions:
+        return
+    risk_manager.open_position(token, adopted)
+    logger.warning(
+        f"[ADOPT] Opened {token.get('symbol', mint[:8])} after late confirm {sig[:12]}"
+    )
+    asyncio.create_task(_prebuild_sell_for_position(executor, risk_manager, mint))
+
+
 async def trade_loop(trade_queue, executor, risk_manager, dashboard, wallet):
     while True:
         try:
@@ -138,6 +222,11 @@ async def trade_loop(trade_queue, executor, risk_manager, dashboard, wallet):
         score   = token.get("score", 0)
         creator = token.get("creator", "")
 
+        if mint in risk_manager.positions:
+            token["reject_reason"] = "already_open"
+            dashboard.record_signal(token)
+            continue
+
         # Block creators that produced repeat losers (see config.CREATOR_BLACKLIST).
         if creator and creator in CREATOR_BLACKLIST:
             logger.info(f"[TRADE LOOP] Skip {symbol}: creator {creator[:8]}... is blacklisted")
@@ -145,7 +234,9 @@ async def trade_loop(trade_queue, executor, risk_manager, dashboard, wallet):
             dashboard.record_signal(token)
             continue
 
-        sol_amount, reject_reason = await risk_manager.calculate_position_size(score, symbol=symbol)
+        sol_amount, reject_reason = await risk_manager.calculate_position_size(
+            score, symbol=symbol, creator=creator,
+        )
         if sol_amount <= 0:
             # reject_reason is one of: emergency_stop, paused_<sub>,
             # max_positions, symbol_cap, max_exposure, size_below_min.
@@ -176,6 +267,10 @@ async def trade_loop(trade_queue, executor, risk_manager, dashboard, wallet):
         else:
             token["reject_reason"] = result.get("error", "buy_failed")
             logger.error(f"[TRADE LOOP] Buy failed {symbol}: {token['reject_reason']}")
+            if result.get("error") == "unconfirmed" and result.get("signature"):
+                asyncio.create_task(
+                    _adopt_landed_buy(executor, risk_manager, wallet, token, result)
+                )
 
         dashboard.record_signal(token)
 
@@ -479,6 +574,7 @@ async def main():
 
     risk_mgr  = RiskManager(wallet, executor)
     await risk_mgr.initialize()
+    await reconcile_positions(risk_mgr, wallet, executor, PAPER_TRADING)
 
     scorer     = SignalScorer(raw_queue, trade_queue, executor=executor)
     dashboard  = Dashboard(risk_mgr, scorer)
